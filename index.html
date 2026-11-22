@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>房屋修圖器</title>
+  <meta name="description" content="房仲用手機修圖：塗掉雜物，AI 自動移除。">
+  <meta name="theme-color" content="#0f766e" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111416" media="(prefers-color-scheme: dark)">
+  <meta name="color-scheme" content="light dark">
+  <!-- iOS 加到主畫面後以 App 方式開啟 -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="房屋修圖器">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <!-- SVG 圖示集（用 <use href="#i-xxx"> 引用） -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-photo" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="10" r="1.8" fill="currentColor"/><path d="M4 18l5-5 4 4 3-3 4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="12" cy="13.5" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3v12M7 8l5-5 5 5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 9h10a6 6 0 0 1 0 12h-3" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 9H10a6 6 0 0 0 0 12h3" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" fill="currentColor"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z" fill="currentColor"/></symbol>
+    <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-house" viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+  </svg>
+
+  <div id="app">
+    <!-- ========== 首頁：案件列表 ========== -->
+    <section id="screen-home" class="screen" aria-label="案件列表">
+      <header class="topbar">
+        <div class="topbar-title">
+          <svg class="brand-icon" aria-hidden="true"><use href="#i-house"/></svg>
+          <h1>房屋修圖器</h1>
+        </div>
+        <button id="btn-settings" class="icon-btn" type="button" aria-label="設定">
+          <svg aria-hidden="true"><use href="#i-gear"/></svg>
+        </button>
+      </header>
+      <main class="content">
+        <div id="storage-warning" class="notice warn" hidden></div>
+        <div id="listing-list" class="listing-list"></div>
+        <div id="home-empty" class="empty" hidden>
+          <svg aria-hidden="true"><use href="#i-house"/></svg>
+          <p class="empty-title">還沒有案件</p>
+          <p>按下方「新增案件」，建立一個物件，<br>再把照片加進去整理。</p>
+        </div>
+      </main>
+      <footer class="bottombar">
+        <button id="btn-new-listing" class="btn primary block" type="button">
+          <svg aria-hidden="true"><use href="#i-plus"/></svg>新增案件
+        </button>
+      </footer>
+    </section>
+
+    <!-- ========== 案件內：照片牆 ========== -->
+    <section id="screen-listing" class="screen" aria-label="照片牆" hidden>
+      <header class="topbar">
+        <button class="icon-btn" data-action="back" type="button" aria-label="返回">
+          <svg aria-hidden="true"><use href="#i-back"/></svg>
+        </button>
+        <button id="listing-title" class="topbar-name" type="button" aria-label="重新命名案件"></button>
+        <button id="btn-listing-more" class="icon-btn" type="button" aria-label="案件選項">
+          <svg aria-hidden="true"><use href="#i-more"/></svg>
+        </button>
+      </header>
+      <main class="content">
+        <p id="listing-summary" class="summary"></p>
+        <div id="photo-grid" class="photo-grid"></div>
+        <div id="listing-empty" class="empty" hidden>
+          <svg aria-hidden="true"><use href="#i-photo"/></svg>
+          <p class="empty-title">這個案件還沒有照片</p>
+          <p>按下方「相簿選照片」或「拍照」加入。<br>點照片就能開始修圖。</p>
+        </div>
+      </main>
+      <footer class="bottombar three">
+        <button id="btn-add-photos" class="btn" type="button">
+          <svg aria-hidden="true"><use href="#i-photo"/></svg>相簿選照片
+        </button>
+        <button id="btn-take-photo" class="btn" type="button">
+          <svg aria-hidden="true"><use href="#i-camera"/></svg>拍照
+        </button>
+        <button id="btn-export-all" class="btn primary" type="button">
+          <svg aria-hidden="true"><use href="#i-share"/></svg>全部匯出
+        </button>
+      </footer>
+      <input id="input-photos" type="file" accept="image/*" multiple hidden>
+      <input id="input-camera" type="file" accept="image/*" capture="environment" hidden>
+    </section>
+
+    <!-- ========== 修圖畫面 ========== -->
+    <section id="screen-editor" class="screen editor" aria-label="修圖" hidden>
+      <header class="editor-top">
+        <button class="icon-btn" data-action="back" type="button" aria-label="返回">
+          <svg aria-hidden="true"><use href="#i-back"/></svg>
+        </button>
+        <div class="seg" role="radiogroup" aria-label="修圖方式">
+          <button type="button" role="radio" data-engine="local" aria-checked="true">免費（手機運算）</button>
+          <button type="button" role="radio" data-engine="gemini" aria-checked="false">強力（Gemini）</button>
+        </div>
+        <button id="ed-save" class="btn primary small" type="button">儲存</button>
+      </header>
+      <div id="ed-banner" class="ed-banner" hidden>
+        <div class="ed-banner-text"></div>
+        <div class="progress"><div class="progress-bar"></div></div>
+      </div>
+      <div id="ed-stage" class="stage">
+        <canvas id="ed-view" class="stage-canvas"></canvas>
+        <canvas id="ed-overlay" class="stage-canvas overlay"></canvas>
+        <div id="ed-hint" class="stage-hint">
+          一根手指<b>塗抹雜物</b>，放開後自動移除<br>
+          兩根手指可放大、移動
+        </div>
+        <div id="ed-compare-tag" class="compare-tag" hidden>原圖</div>
+        <button id="ed-fit" class="fit-btn" type="button" aria-label="顯示整張" hidden>
+          <svg aria-hidden="true"><use href="#i-fit"/></svg>
+        </button>
+        <div id="ed-busy" class="stage-busy" hidden>
+          <div class="spinner" aria-hidden="true"></div>
+          <p id="ed-busy-text" role="status" aria-live="polite">處理中…</p>
+          <div class="progress"><div id="ed-busy-bar" class="progress-bar"></div></div>
+        </div>
+      </div>
+      <footer class="editor-bottom">
+        <div class="brush-row">
+          <span class="brush-label">筆刷</span>
+          <input id="ed-brush" type="range" min="12" max="120" step="2" value="44" aria-label="筆刷大小">
+          <span class="brush-dot-wrap" aria-hidden="true"><span id="ed-brush-dot" class="brush-dot"></span></span>
+        </div>
+        <div class="tool-row">
+          <button id="ed-undo" class="tool" type="button"><svg aria-hidden="true"><use href="#i-undo"/></svg><span>復原</span></button>
+          <button id="ed-redo" class="tool" type="button"><svg aria-hidden="true"><use href="#i-redo"/></svg><span>重做</span></button>
+          <button id="ed-compare" class="tool" type="button"><svg aria-hidden="true"><use href="#i-eye"/></svg><span>按住看原圖</span></button>
+          <button id="ed-declutter" class="tool accent" type="button" hidden><svg aria-hidden="true"><use href="#i-sparkle"/></svg><span>一鍵整理</span></button>
+        </div>
+        <p class="editor-rule">只移除可移動的雜物；壁癌、漏水、裂縫、窗外設施不可修掉</p>
+      </footer>
+    </section>
+
+    <!-- ========== 設定 ========== -->
+    <section id="screen-settings" class="screen" aria-label="設定" hidden>
+      <header class="topbar">
+        <button class="icon-btn" data-action="back" type="button" aria-label="返回">
+          <svg aria-hidden="true"><use href="#i-back"/></svg>
+        </button>
+        <h1 class="topbar-name static">設定</h1>
+        <span class="icon-btn-spacer"></span>
+      </header>
+      <main class="content settings">
+        <section class="card">
+          <h2>預設修圖方式</h2>
+          <div class="radio-list" role="radiogroup">
+            <label class="radio"><input type="radio" name="default-engine" value="local">
+              <span><b>免費（手機運算）</b><small>在手機上用 AI 移除，不用網路、不花錢。適合小雜物。</small></span></label>
+            <label class="radio"><input type="radio" name="default-engine" value="gemini">
+              <span><b>強力（Gemini）</b><small>用 Google Gemini 處理，效果較好，需要金鑰與網路。</small></span></label>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Gemini API 金鑰（強力模式用）</h2>
+          <div class="key-row">
+            <input id="set-apikey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="貼上金鑰（AIza 開頭）" aria-label="Gemini API 金鑰">
+            <button id="set-apikey-show" class="btn small" type="button">顯示</button>
+          </div>
+          <div class="row-actions">
+            <button id="set-apikey-test" class="btn" type="button">測試金鑰</button>
+            <button id="set-apikey-clear" class="btn ghost" type="button">清除</button>
+          </div>
+          <p id="set-apikey-result" class="key-result" role="status" aria-live="polite"></p>
+          <details class="howto">
+            <summary>怎麼取得金鑰？</summary>
+            <ol>
+              <li>用電腦或手機開啟 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com/apikey</a>，用 Google 帳號登入。</li>
+              <li>按「Create API key（建立 API 金鑰）」。</li>
+              <li>複製產生的金鑰（AIza 開頭的一長串），貼到上面欄位。</li>
+              <li>按「測試金鑰」，出現成功訊息就可以用了。</li>
+            </ol>
+            <p class="muted">金鑰只存在這支手機上，不會上傳到其他地方。使用量與費用依 Google 規定計算。</p>
+          </details>
+        </section>
+
+        <section class="card">
+          <h2>匯出</h2>
+          <label class="switch-row">
+            <span><b>加上浮水印「照片經整理示意」</b><small>只加在修過的照片右下角，原圖不加。</small></span>
+            <input id="set-watermark" type="checkbox" class="switch">
+          </label>
+        </section>
+
+        <section class="card compliance">
+          <h2>合規提醒</h2>
+          <div id="compliance-text"></div>
+        </section>
+
+        <section class="card">
+          <h2>關於</h2>
+          <p id="about-info" class="muted">房屋修圖器</p>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <!-- 對話框、提示訊息、全畫面忙碌遮罩 -->
+  <div id="modal-root"></div>
+  <div id="toast-root" aria-live="polite"></div>
+  <noscript><p style="padding:24px">請開啟瀏覽器的 JavaScript 才能使用。</p></noscript>
+</body>
+</html>
