@@ -1,11 +1,15 @@
-// 房屋修圖器 Service Worker：外殼快取優先；HTML 導覽網路優先；不碰 Gemini API 與模型快取
-const SHELL = 'house-shell-v1';
-const KEEP = [SHELL, 'house-ai-models-v1']; // 模型快取由 engine 管理，絕不刪除
+// 房屋修圖器 Service Worker
+// 策略：有網路 → 一律拿最新版（並順便存一份）；沒網路 → 用存起來的舊版。
+// 這樣每次修正上線後，手機重新打開 App 就會拿到新版，不會卡在舊程式。
+// 不碰 Gemini API、CDN、以及 AI 模型（模型快取 'house-ai-models-v1' 由 engine/local.js 管理）。
+const SHELL = 'house-shell-v2';
+const KEEP = [SHELL, 'house-ai-models-v1'];
 const FILES = [
   './', './index.html', './styles.css', './app.js',
   './engine/local.js', './engine/gemini.js',
   './lib/db.js', './lib/image.js', './lib/editor.js', './lib/engines.js',
   './lib/export.js', './lib/ui.js', './lib/settings.js',
+  './lib/errors.js', './lib/tutorial.js',
   './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
 ];
@@ -13,8 +17,9 @@ const FILES = [
 self.addEventListener('install', (e) => {
   e.waitUntil((async () => {
     const c = await caches.open(SHELL);
-    await Promise.all(FILES.map((f) => c.add(f).catch(() => {})));
-    self.skipWaiting();
+    // 逐一快取，缺檔不影響安裝；cache:'reload' 繞過瀏覽器 HTTP 快取，確保存到最新版
+    await Promise.all(FILES.map((f) => c.add(new Request(f, { cache: 'reload' })).catch(() => {})));
+    await self.skipWaiting();
   })());
 });
 
@@ -31,33 +36,24 @@ self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (url.hostname === 'generativelanguage.googleapis.com') return; // 不攔截
-  if (url.origin !== location.origin) return; // CDN / HuggingFace 交給瀏覽器與 engine
-  if (req.mode === 'navigate') {
-    e.respondWith((async () => {
-      try {
-        const res = await fetch(req);
-        const c = await caches.open(SHELL);
-        c.put('./index.html', res.clone()).catch(() => {});
-        return res;
-      } catch (err) {
-        return (await caches.match('./index.html')) || (await caches.match('./')) || Response.error();
-      }
-    })());
-    return;
-  }
+  if (url.origin !== location.origin) return;       // Gemini / CDN / HuggingFace 不攔截
+  if (url.pathname.includes('/models/')) return;     // 模型交給 engine 自己快取
+
   e.respondWith((async () => {
-    const hit = await caches.match(req);
-    if (hit) return hit;
     try {
-      const res = await fetch(req);
-      if (res.ok && !url.pathname.includes('/models/')) {
+      // 網路優先，且繞過 HTTP 快取（GitHub Pages 預設快取 10 分鐘）
+      const res = await fetch(req, { cache: 'no-cache' });
+      if (res.ok) {
         const c = await caches.open(SHELL);
-        c.put(req, res.clone()).catch(() => {});
+        c.put(req.mode === 'navigate' ? './index.html' : req, res.clone()).catch(() => {});
       }
       return res;
     } catch (err) {
-      return Response.error();
+      // 離線：用存起來的版本
+      const hit = req.mode === 'navigate'
+        ? (await caches.match('./index.html')) || (await caches.match('./'))
+        : await caches.match(req, { ignoreSearch: true });
+      return hit || Response.error();
     }
   })());
 });

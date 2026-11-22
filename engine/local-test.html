@@ -18,6 +18,7 @@
 <h1>本機 AI 引擎測試（engine/local.js）</h1>
 <p>
   <label>尺寸 <select id="size">
+    <option value="2560x1920" selected>2560×1920（App 工作尺寸）</option>
     <option value="1200x900">1200×900</option>
     <option value="4000x3000">4000×3000（手機大圖）</option>
     <option value="640x480">640×480</option>
@@ -26,6 +27,11 @@
 </p>
 <button id="load">1. 預先載入模型</button>
 <button id="run">2. 產生測試圖並移除雜物</button>
+<br>
+<button id="early">3. 不等載入就修圖（請先重新整理頁面）</button>
+<button id="twice">4. 同時呼叫兩次</button>
+<button id="info">引擎資訊</button>
+<button id="clearCache">清除模型快取（模擬第一次開啟）</button>
 <progress id="prog" value="0" max="1"></progress>
 <div id="status">尚未開始</div>
 <div class="row">
@@ -39,11 +45,20 @@ import { loadLocalModel, inpaintLocal, getLocalEngineInfo } from './local.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log');
+function fmt(x) {
+  if (x instanceof Error) return `${x.message}${x.code ? ' [' + x.code + ']' : ''}${x.detail ? '\n  detail: ' + x.detail : x.cause ? ' ← ' + (x.cause.message || x.cause) : ''}`;
+  if (x && typeof x === 'object') { try { return JSON.stringify(x); } catch { return String(x); } }
+  return String(x);
+}
+function showErr(e) {
+  console.error(e);
+  $('status').textContent = '錯誤：' + e.message + (e.code ? `（${e.code}）` : '');
+}
 for (const k of ['log', 'warn', 'error']) {
   const orig = console[k].bind(console);
   console[k] = (...a) => {
     orig(...a);
-    logEl.textContent += `[${k}] ` + a.map((x) => (x instanceof Error ? x.message + (x.cause ? ' ← ' + (x.cause.message || x.cause) : '') : typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ') + '\n';
+    logEl.textContent += `[${k}] ` + a.map(fmt).join(' ') + '\n';
     logEl.scrollTop = logEl.scrollHeight;
   };
 }
@@ -95,25 +110,77 @@ $('load').onclick = async () => {
     await loadLocalModel(onProgress);
     console.log('model loaded in', Math.round(performance.now() - t), 'ms', getLocalEngineInfo());
     $('status').textContent = '模型就緒：' + JSON.stringify(getLocalEngineInfo());
-  } catch (e) { console.error(e); $('status').textContent = '錯誤：' + e.message; }
+  } catch (e) { showErr(e); }
 };
 
-$('run').onclick = async () => {
+function checkResult(tag, img, out, ms) {
+  const W = img.width, H = img.height;
+  // 驗證：遮罩外（遠離遮罩）的像素應完全相同
+  const a = img.getContext('2d').getImageData(W - 50, H - 50, 50, 50).data;
+  const b = out.getContext('2d').getImageData(W - 50, H - 50, 50, 50).data;
+  let same = 0; for (let i = 0; i < a.length; i++) if (a[i] === b[i]) same++;
+  console.log(`${tag} ${W}x${H} done in ${ms}ms; out ${out.width}x${out.height} sizeOK=${out.width === W && out.height === H}; untouched corner identical=${same === a.length}`, getLocalEngineInfo());
+}
+
+function makeCase() {
   const [W, H] = $('size').value.split('x').map(Number);
-  const { img, mask } = makeTestImage(W, H, $('multi').checked);
-  show('before', img); show('mask', mask);
+  const c = makeTestImage(W, H, $('multi').checked);
+  show('before', c.img); show('mask', c.mask);
+  return c;
+}
+
+$('run').onclick = async () => {
+  const { img, mask } = makeCase();
   const t = performance.now();
   try {
     const out = await inpaintLocal(img, mask, onProgress);
     const ms = Math.round(performance.now() - t);
     show('after', out);
-    // 驗證：遮罩外（遠離遮罩）的像素應完全相同
-    const a = img.getContext('2d').getImageData(W - 50, H - 50, 50, 50).data;
-    const b = out.getContext('2d').getImageData(W - 50, H - 50, 50, 50).data;
-    let same = 0; for (let i = 0; i < a.length; i++) if (a[i] === b[i]) same++;
-    console.log(`inpaint ${W}x${H} done in ${ms}ms; out ${out.width}x${out.height}; untouched bottom-right corner identical=${same === a.length}`, getLocalEngineInfo());
+    checkResult('inpaint', img, out, ms);
     $('status').textContent = `完成：${ms} ms（${getLocalEngineInfo().backend}）`;
-  } catch (e) { console.error(e); $('status').textContent = '錯誤：' + e.message; }
+  } catch (e) { showErr(e); }
+};
+
+// 模擬 App：背景開始載入模型，使用者立刻塗抹 → inpaintLocal 必須等同一個載入，不可建立第二個 session
+$('early').onclick = async () => {
+  console.log('info before:', getLocalEngineInfo());
+  const loadP = loadLocalModel((p) => onProgress(p));
+  loadP.then(() => console.log('loadLocalModel resolved'), (e) => console.warn('loadLocalModel rejected', e));
+  const { img, mask } = makeCase();
+  const t = performance.now();
+  try {
+    const out = await inpaintLocal(img, mask, onProgress);
+    show('after', out);
+    checkResult('early inpaint', img, out, Math.round(performance.now() - t));
+    $('status').textContent = '完成（載入中就呼叫）';
+  } catch (e) { showErr(e); }
+};
+
+// 兩次同時呼叫：應排隊依序執行，兩個都成功
+$('twice').onclick = async () => {
+  const { img, mask } = makeCase();
+  const t = performance.now();
+  const order = [];
+  const p1 = inpaintLocal(img, mask, (p) => { if (p.stage === 'infer' || p.stage === 'done') order.push('1:' + p.stage); onProgress(p); });
+  const p2 = inpaintLocal(img, mask, (p) => { if (p.stage === 'infer' || p.stage === 'done') order.push('2:' + p.stage); onProgress(p); });
+  const rs = await Promise.allSettled([p1, p2]);
+  const ms = Math.round(performance.now() - t);
+  rs.forEach((r, i) => {
+    if (r.status === 'fulfilled') checkResult('concurrent #' + (i + 1), img, r.value, ms);
+    else console.error('concurrent #' + (i + 1) + ' failed', r.reason);
+  });
+  console.log('progress order (should be all 1:* then all 2:*):', order.join(' '));
+  if (rs[1].status === 'fulfilled') show('after', rs[1].value);
+  $('status').textContent = rs.every((r) => r.status === 'fulfilled') ? `兩次都完成：${ms} ms` : '有失敗，見記錄';
+};
+
+$('info').onclick = () => console.log('info:', getLocalEngineInfo());
+
+$('clearCache').onclick = async () => {
+  try {
+    const ok = await caches.delete('house-ai-models-v1');
+    console.log('model cache deleted =', ok, '— 請重新整理頁面後按 3');
+  } catch (e) { showErr(e); }
 };
 </script>
 </body>

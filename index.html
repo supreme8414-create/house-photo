@@ -34,6 +34,8 @@
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
     <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" fill="currentColor"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z" fill="currentColor"/></symbol>
     <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-clear" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-house" viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
   </svg>
 
@@ -76,6 +78,10 @@
           <svg aria-hidden="true"><use href="#i-more"/></svg>
         </button>
       </header>
+      <div id="listing-ai" class="ai-strip" role="status" aria-live="polite" hidden>
+        <div class="ai-text"></div>
+        <div class="progress"><div class="progress-bar"></div></div>
+      </div>
       <main class="content">
         <p id="listing-summary" class="summary"></p>
         <div id="photo-grid" class="photo-grid"></div>
@@ -103,24 +109,36 @@
     <!-- ========== 修圖畫面 ========== -->
     <section id="screen-editor" class="screen editor" aria-label="修圖" hidden>
       <header class="editor-top">
-        <button class="icon-btn" data-action="back" type="button" aria-label="返回">
+        <button class="icon-btn" data-action="back" type="button" aria-label="返回照片牆">
           <svg aria-hidden="true"><use href="#i-back"/></svg>
         </button>
+        <div class="ed-nav">
+          <button id="ed-prev" class="icon-btn" type="button" aria-label="上一張">
+            <svg aria-hidden="true" style="transform:scaleX(-1)"><use href="#i-next"/></svg>
+          </button>
+          <span id="ed-counter" class="ed-counter" aria-live="polite"></span>
+          <button id="ed-next" class="icon-btn" type="button" aria-label="下一張">
+            <svg aria-hidden="true"><use href="#i-next"/></svg>
+          </button>
+        </div>
+        <button id="ed-help" class="icon-btn help-btn" type="button" aria-label="怎麼用（教學）">?</button>
+        <button id="ed-save" class="btn primary small" type="button">儲存</button>
+      </header>
+      <div class="ed-engine-row">
         <div class="seg" role="radiogroup" aria-label="修圖方式">
           <button type="button" role="radio" data-engine="local" aria-checked="true">免費（手機運算）</button>
           <button type="button" role="radio" data-engine="gemini" aria-checked="false">強力（Gemini）</button>
         </div>
-        <button id="ed-save" class="btn primary small" type="button">儲存</button>
-      </header>
-      <div id="ed-banner" class="ed-banner" hidden>
-        <div class="ed-banner-text"></div>
+      </div>
+      <div id="ed-banner" class="ai-strip dark" role="status" aria-live="polite" hidden>
+        <div class="ai-text"></div>
         <div class="progress"><div class="progress-bar"></div></div>
       </div>
       <div id="ed-stage" class="stage">
         <canvas id="ed-view" class="stage-canvas"></canvas>
         <canvas id="ed-overlay" class="stage-canvas overlay"></canvas>
         <div id="ed-hint" class="stage-hint">
-          一根手指<b>塗抹雜物</b>，放開後自動移除<br>
+          一根手指<b>塗抹雜物</b>，塗好按下方「✨ 移除」<br>
           兩根手指可放大、移動
         </div>
         <div id="ed-compare-tag" class="compare-tag" hidden>原圖</div>
@@ -135,16 +153,21 @@
       </div>
       <footer class="editor-bottom">
         <div class="brush-row">
-          <span class="brush-label">筆刷</span>
+          <div class="mode-seg" role="radiogroup" aria-label="塗抹或橡皮擦">
+            <button type="button" role="radio" data-tool="paint" aria-checked="true">🖌 塗抹</button>
+            <button type="button" role="radio" data-tool="erase" aria-checked="false">🧽 橡皮擦</button>
+          </div>
           <input id="ed-brush" type="range" min="12" max="120" step="2" value="44" aria-label="筆刷大小">
           <span class="brush-dot-wrap" aria-hidden="true"><span id="ed-brush-dot" class="brush-dot"></span></span>
         </div>
         <div class="tool-row">
           <button id="ed-undo" class="tool" type="button"><svg aria-hidden="true"><use href="#i-undo"/></svg><span>復原</span></button>
           <button id="ed-redo" class="tool" type="button"><svg aria-hidden="true"><use href="#i-redo"/></svg><span>重做</span></button>
-          <button id="ed-compare" class="tool" type="button"><svg aria-hidden="true"><use href="#i-eye"/></svg><span>按住看原圖</span></button>
+          <button id="ed-compare" class="tool" type="button" aria-label="按住看原圖"><svg aria-hidden="true"><use href="#i-eye"/></svg><span>按住原圖</span></button>
+          <button id="ed-clear" class="tool" type="button"><svg aria-hidden="true"><use href="#i-clear"/></svg><span>清除塗抹</span></button>
           <button id="ed-declutter" class="tool accent" type="button" hidden><svg aria-hidden="true"><use href="#i-sparkle"/></svg><span>一鍵整理</span></button>
         </div>
+        <button id="ed-remove" class="remove-btn" type="button" disabled>先塗抹要移除的東西</button>
         <p class="editor-rule">只移除可移動的雜物；壁癌、漏水、裂縫、窗外設施不可修掉</p>
       </footer>
     </section>
@@ -209,6 +232,8 @@
           <h2>關於</h2>
           <p id="about-info" class="muted">房屋修圖器</p>
         </section>
+
+        <p id="app-version" class="app-version"></p>
       </main>
     </section>
   </div>

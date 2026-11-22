@@ -10,6 +10,11 @@ import * as eng from './lib/engines.js';
 import { settings } from './lib/settings.js';
 import { Editor } from './lib/editor.js';
 import { buildExportFile, deliverFiles } from './lib/export.js';
+import { showError, configureErrors, installGlobalHandlers, MEMORY_HINT } from './lib/errors.js';
+import { showTutorial } from './lib/tutorial.js';
+
+/** App 版本（設定頁最下方會顯示，用來確認手機是不是跑新版） */
+const APP_VERSION = '1.1.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 
@@ -25,8 +30,23 @@ const cur = { screen: 'home', listingId: null, listing: null, photos: [] };
 
 /** 撤銷步驟上限（含原圖那一格） */
 const HISTORY_LIMIT = 10;
-/** 放開手指後多久自動開始移除 */
-const AUTO_RUN_DELAY = 400;
+/** 修圖工作尺寸上限（記憶體不足時會降到 1920，這次開啟期間都用小尺寸） */
+let workMax = img.MAX_SIDE;
+
+// 錯誤回報：技術資訊裡附上目前狀態
+installGlobalHandlers();
+configureErrors({
+  appVersion: APP_VERSION,
+  context: () => {
+    const o = { 畫面: cur.screen, 儲存方式: db.storageMode, 工作尺寸上限: workMax };
+    if (editor && editor.image) o.照片尺寸 = `${editor.image.width}×${editor.image.height}`;
+    if (ed) o.修圖方式 = ed.engine === 'gemini' ? 'Gemini' : '本機';
+    o.本機AI狀態 = eng.localModelStatus();
+    const info = eng.localEngineInfoSync();
+    if (info) o.本機AI = `${info.name || ''} / ${info.backend || ''}${info.ortVersion ? ' / ort ' + info.ortVersion : ''}`;
+    return o;
+  },
+});
 
 const COMPLIANCE_HTML = `
   <div class="compliance-body">
@@ -99,8 +119,10 @@ async function applyState(s) {
       if (!(await openListing(s.listingId))) return navigate({ screen: 'home' }, { replace: true });
       break;
     case 'editor':
-      if (ed && ed.photoId === s.photoId) { showScreen('editor'); editor.resize(); }
-      else if (!(await openEditor(s.listingId, s.photoId))) return navigate({ screen: 'home' }, { replace: true });
+      if (ed && ed.photoId === s.photoId) { showScreen('editor'); editor.resize(); refreshModelUI(); }
+      else if (!(await openEditor(s.listingId, s.photoId))) {
+        return navigate(db.isValidId(s.listingId) ? { screen: 'listing', listingId: s.listingId } : { screen: 'home' }, { replace: true });
+      }
       break;
     case 'settings':
       await openSettings();
@@ -108,6 +130,7 @@ async function applyState(s) {
     default:
       await openHome();
   }
+  maybeReloadForUpdate();
 }
 
 /** 返回（畫面左上角的返回鍵） */
@@ -125,25 +148,16 @@ window.addEventListener('popstate', async (e) => {
       ui.toast('AI 處理中，請稍候');
       return;
     }
-    if (isDirty()) {
+    if (isDirty() || hasPendingMask()) {
       history.pushState(stateNow(), '');
-      const choice = await ui.dialog({
-        title: '修改還沒儲存',
-        message: '要先儲存這張照片的修改嗎？',
-        buttons: [
-          { label: '儲存後離開', value: 'save', primary: true },
-          { label: '不儲存，直接離開', value: 'discard', dangerText: true },
-          { label: '繼續修圖', value: null },
-        ],
-      });
-      if (choice === 'save') { if (!(await saveEdit())) return; }
-      else if (choice !== 'discard') return;
-      if (ed) ed.savedIndex = ed.hIndex; // 標記為不需再問
+      if (!(await confirmLeave())) return;
+      if (ed) { ed.savedIndex = ed.hIndex; editor.clearMask(); } // 標記為不需再問
       history.back();
       return;
     }
   }
-  await applyState(s);
+  try { await applyState(s); }
+  catch (err) { showError('畫面切換失敗', err); }
 });
 
 window.addEventListener('beforeunload', (e) => {
@@ -160,6 +174,9 @@ document.addEventListener('click', (e) => {
 // =========================================================
 async function openHome() {
   showScreen('home');
+  cur.listingId = null;
+  cur.listing = null;
+  cur.photos = [];
   revokeBucket('listing');
   await renderHome();
 }
@@ -169,7 +186,7 @@ async function renderHome() {
   revokeBucket('home');
   let items = [];
   try { items = await db.listListings(); }
-  catch (e) { ui.alert('讀取案件失敗', eng.errorMessage(e)); }
+  catch (e) { showError('讀取案件失敗', e); }
 
   list.replaceChildren(...items.map(listingCard));
   $('#home-empty').hidden = items.length > 0;
@@ -244,7 +261,7 @@ async function newListingFlow() {
     const l = await db.createListing(name || `新案件 ${d.getMonth() + 1}/${d.getDate()}`);
     await navigate({ screen: 'listing', listingId: l.id });
   } catch (e) {
-    ui.alert('建立失敗', eng.errorMessage(e));
+    showError('建立失敗', e);
   }
 }
 
@@ -256,7 +273,7 @@ async function renameListingFlow(l) {
     if (cur.listingId === l.id) { cur.listing = updated; $('#listing-title').textContent = updated.name; }
     if (cur.screen === 'home') await renderHome();
     ui.toast('已重新命名');
-  } catch (e) { ui.alert('重新命名失敗', eng.errorMessage(e)); }
+  } catch (e) { showError('重新命名失敗', e); }
 }
 
 async function deleteListingFlow(l) {
@@ -271,15 +288,16 @@ async function deleteListingFlow(l) {
     ui.toast('已刪除案件');
     if (cur.screen === 'listing') await navigate({ screen: 'home' }, { replace: true });
     else await renderHome();
-  } catch (e) { ui.alert('刪除失敗', eng.errorMessage(e)); }
+  } catch (e) { showError('刪除失敗', e); }
 }
 
 // =========================================================
 // 照片牆
 // =========================================================
 async function openListing(listingId) {
+  if (!db.isValidId(listingId)) return false;
   let l = null;
-  try { l = await db.getListing(listingId); } catch (e) { ui.alert('讀取失敗', eng.errorMessage(e)); }
+  try { l = await db.getListing(listingId); } catch (e) { showError('讀取失敗', e); }
   if (!l) return false;
   cur.listingId = l.id;
   cur.listing = l;
@@ -287,6 +305,8 @@ async function openListing(listingId) {
   showScreen('listing');
   revokeBucket('home');
   await renderPhotos();
+  // 一打開案件就先在背景準備 AI，進修圖畫面時就不用等
+  preloadModel();
   return true;
 }
 
@@ -295,7 +315,7 @@ async function renderPhotos() {
   revokeBucket('listing');
   let photos = [];
   try { photos = await db.listPhotos(cur.listingId); }
-  catch (e) { ui.alert('讀取照片失敗', eng.errorMessage(e)); }
+  catch (e) { showError('讀取照片失敗', e); }
   cur.photos = photos;
 
   grid.replaceChildren(...photos.map((p, i) => photoTile(p, i)));
@@ -361,44 +381,54 @@ async function photoMenu(p, i) {
     const ok = await ui.confirm('恢復原圖？', '這張照片的修圖結果會被移除，回到拍攝時的樣子。原圖一直都有保留。', { okLabel: '恢復原圖', danger: true });
     if (!ok) return;
     try { await db.saveEdited(p.id, null, null); ui.toast('已恢復原圖'); await renderPhotos(); }
-    catch (e) { ui.alert('恢復失敗', eng.errorMessage(e)); }
+    catch (e) { showError('恢復失敗', e); }
   }
   if (v === 'delete') {
     const ok = await ui.confirm('刪除這張照片？', '原圖和修好的照片都會從這支手機刪除，無法復原。', { okLabel: '刪除', danger: true });
     if (!ok) return;
     try { await db.deletePhoto(p.id); ui.toast('已刪除'); await renderPhotos(); }
-    catch (e) { ui.alert('刪除失敗', eng.errorMessage(e)); }
+    catch (e) { showError('刪除失敗', e); }
   }
 }
+
+const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
 let persistAsked = false;
 async function importFiles(fileList) {
   const files = [...(fileList || [])].filter((f) => !f.type || f.type.startsWith('image/'));
   if (!files.length) return;
+  // 一定要在某個案件裡才能加照片
+  const listingId = cur.listingId;
+  if (cur.screen !== 'listing' || !db.isValidId(listingId)) {
+    ui.alert('請先開啟案件', '請回到首頁，點一個案件（或按「新增案件」），再加入照片。');
+    return;
+  }
   if (!persistAsked) { persistAsked = true; db.requestPersist(); }
   const busy = ui.busy('加入照片中…');
   let ok = 0;
   const failed = [];
   try {
+    // 一張一張處理，處理完立刻釋放記憶體（iOS 一次處理多張容易記憶體不足）
     for (let i = 0; i < files.length; i++) {
-      busy.update(`加入照片中 ${i + 1} / ${files.length}`);
+      busy.update(files.length > 1 ? `加入照片中 ${i + 1} / ${files.length}` : '加入照片中…');
       try {
         const data = await img.importPhotoFile(files[i]);
-        await db.addPhoto(cur.listingId, data);
+        await db.addPhoto(listingId, data);
         ok++;
       } catch (e) {
         console.error(e);
-        failed.push(eng.errorMessage(e));
-        // 空間不足就不要再試後面的
-        if (/空間不足/.test(failed[failed.length - 1])) break;
+        failed.push(e);
+        // 空間不足、或案件不見了，就不要再試後面的
+        if (e && (e.code === 'STORAGE_FULL' || e.code === 'NO_LISTING')) break;
       }
+      await tick(30); // 讓瀏覽器有機會回收記憶體
     }
   } finally {
     busy.close();
   }
-  await renderPhotos();
+  if (cur.screen === 'listing' && cur.listingId === listingId) await renderPhotos();
   if (failed.length) {
-    ui.alert(ok ? `已加入 ${ok} 張，${failed.length} 張失敗` : '加入照片失敗', failed[0]);
+    showError(ok ? `已加入 ${ok} 張，${failed.length} 張失敗` : '加入照片失敗', failed[0]);
   } else {
     ui.toast(`已加入 ${ok} 張照片`);
   }
@@ -420,14 +450,16 @@ async function exportPhotos(items) {
         index: items[k].index,
         watermark: settings.watermark,
       }));
+      await tick(0);
     }
   } catch (e) {
     busy.close();
-    ui.alert('匯出失敗', eng.errorMessage(e));
+    showError('匯出失敗', e);
     return;
   }
   busy.close();
-  await deliverFiles(files);
+  try { await deliverFiles(files); }
+  catch (e) { showError('匯出失敗', e); }
 }
 
 async function exportAll() {
@@ -450,6 +482,82 @@ async function exportAll() {
 }
 
 // =========================================================
+// AI 模型預先準備（照片牆與修圖畫面共用的「AI 準備中 x%」細條）
+// =========================================================
+function makeStrip(el) {
+  return { el, text: el.querySelector('.ai-text'), prog: el.querySelector('.progress'), fill: el.querySelector('.progress-bar') };
+}
+const strips = { listing: makeStrip($('#listing-ai')), editor: makeStrip($('#ed-banner')) };
+
+/** 目前想用的是不是本機 AI */
+function wantLocal() {
+  return (ed ? ed.engine : (sessionEngine || settings.defaultEngine)) === 'local';
+}
+
+function setStrip(s, visible, text, ratio, isError) {
+  s.el.hidden = !visible;
+  if (!visible) return;
+  s.el.classList.toggle('error', !!isError);
+  s.text.textContent = text;
+  s.prog.hidden = !!isError;
+  s.prog.classList.toggle('indeterminate', ratio == null);
+  s.fill.style.width = ratio == null ? '' : Math.round(ratio * 100) + '%';
+}
+
+let modelUIRaf = 0;
+function refreshModelUI() {
+  if (modelUIRaf) return;
+  modelUIRaf = requestAnimationFrame(() => {
+    modelUIRaf = 0;
+    const st = eng.modelState();
+    const show = wantLocal() && (st.status === 'loading' || st.status === 'error');
+    let text = '';
+    let ratio = null;
+    const err = st.status === 'error';
+    if (err) text = '⚠ AI 準備失敗，點這裡看原因／重試';
+    else {
+      ratio = st.ratio;
+      const pct = ratio != null ? `　${Math.round(ratio * 100)}%` : '';
+      text = (settings.modelLoadedOnce ? 'AI 準備中' : 'AI 準備中（第一次需下載約 30MB，只需一次）') + pct;
+    }
+    setStrip(strips.listing, show && cur.screen === 'listing', text, ratio, err);
+    setStrip(strips.editor, show && cur.screen === 'editor', text, ratio, err);
+  });
+}
+eng.onModelProgress(() => refreshModelUI());
+
+/** 在背景開始準備本機 AI（已準備好或準備中就不重複） */
+function preloadModel() {
+  refreshModelUI();
+  if (!wantLocal()) return;
+  const status = eng.localModelStatus();
+  if (status === 'ready' || status === 'loading') return;
+  const firstTime = !settings.modelLoadedOnce;
+  eng.ensureLocalModel().then(() => {
+    settings.modelLoadedOnce = true;
+    refreshModelUI();
+    if (firstTime) ui.toast('AI 已準備好，之後不用再下載');
+  }).catch((e) => {
+    console.error('AI 預先準備失敗', e);
+    refreshModelUI();
+  });
+}
+
+async function modelErrorClicked() {
+  const st = eng.modelState();
+  if (st.status !== 'error') return;
+  const v = await showError('AI 準備失敗', st.error, {
+    hint: '請確認網路連線。' + (eng.isMemoryError(st.error) ? '\n' + MEMORY_HINT : ''),
+    buttons: [
+      { label: '重試', value: 'retry', primary: true },
+      { label: '關閉', value: null },
+    ],
+  });
+  if (v === 'retry') preloadModel();
+}
+for (const s of Object.values(strips)) s.el.addEventListener('click', modelErrorClicked);
+
+// =========================================================
 // 修圖畫面
 // =========================================================
 const editor = new Editor($('#ed-stage'), $('#ed-view'), $('#ed-overlay'));
@@ -459,73 +567,122 @@ const editor = new Editor($('#ed-stage'), $('#ed-view'), $('#ed-overlay'));
  * @type {null | {
  *   listingId:string, photoId:string, photo:any,
  *   history:Blob[], hIndex:number, savedIndex:number,
- *   engine:'local'|'gemini', busy:boolean, timer:any,
+ *   engine:'local'|'gemini', busy:boolean,
  *   compareCanvas:HTMLCanvasElement|null, holding:boolean
  * }}
  */
 let ed = null;
 /** 這次開啟 App 期間最後選的修圖方式 */
 let sessionEngine = null;
-let unsubModel = null;
 
 const edEls = {
   save: $('#ed-save'),
   undo: $('#ed-undo'),
   redo: $('#ed-redo'),
   compare: $('#ed-compare'),
+  clear: $('#ed-clear'),
   declutter: $('#ed-declutter'),
+  remove: $('#ed-remove'),
   brush: $('#ed-brush'),
   brushDot: $('#ed-brush-dot'),
   busy: $('#ed-busy'),
   busyText: $('#ed-busy-text'),
   busyBar: $('#ed-busy-bar'),
-  banner: $('#ed-banner'),
   hint: $('#ed-hint'),
   fit: $('#ed-fit'),
   compareTag: $('#ed-compare-tag'),
+  prev: $('#ed-prev'),
+  next: $('#ed-next'),
+  counter: $('#ed-counter'),
+  help: $('#ed-help'),
   seg: [...document.querySelectorAll('.seg [data-engine]')],
+  tools: [...document.querySelectorAll('.mode-seg [data-tool]')],
 };
 
 function isDirty() {
   return !!ed && ed.hIndex !== ed.savedIndex;
 }
 
+/** 有塗抹但還沒按「移除」 */
+function hasPendingMask() {
+  return !!ed && editor.hasMask() && !editor.maskIsEmpty();
+}
+
+/** 要離開這張照片前的確認。可以離開就回傳 true */
+async function confirmLeave() {
+  if (!ed) return true;
+  if (isDirty()) {
+    const choice = await ui.dialog({
+      title: '修改還沒儲存',
+      message: '要先儲存這張照片的修改嗎？',
+      buttons: [
+        { label: '儲存', value: 'save', primary: true },
+        { label: '不儲存', value: 'discard', dangerText: true },
+        { label: '繼續修圖', value: null },
+      ],
+    });
+    if (choice === 'save') return saveEdit();
+    return choice === 'discard';
+  }
+  if (hasPendingMask()) {
+    return ui.confirm('塗抹的地方還沒移除', '離開後，紅色塗抹會消失。確定要離開嗎？', { okLabel: '離開', cancelLabel: '繼續修圖' });
+  }
+  return true;
+}
+
 async function openEditor(listingId, photoId) {
   closeEditor();
+  if (!db.isValidId(photoId)) return false;
   let photo;
-  try { photo = await db.getPhoto(photoId); } catch (e) { ui.alert('讀取失敗', eng.errorMessage(e)); return false; }
-  if (!photo) return false;
-  if (!cur.listing || cur.listingId !== photo.listingId) {
-    try { cur.listing = await db.getListing(photo.listingId); cur.listingId = photo.listingId; } catch { /* 忽略 */ }
+  try { photo = await db.getPhoto(photoId); } catch (e) { showError('讀取失敗', e); return false; }
+  if (!photo) { ui.toast('找不到這張照片'); return false; }
+  if (!cur.listing || cur.listingId !== photo.listingId || !cur.photos.length) {
+    try {
+      cur.listing = await db.getListing(photo.listingId);
+      cur.listingId = photo.listingId;
+      cur.photos = await db.listPhotos(photo.listingId);
+    } catch { /* 忽略：只影響上一張／下一張 */ }
   }
 
   showScreen('editor');
   const busy = ui.busy('開啟照片中…');
+  let canvas = null;
   try {
     const original = await db.getOriginal(photoId);
     if (!original) throw new Error('找不到這張照片的原圖資料');
     const edited = photo.edited ? await db.getEdited(photoId) : null;
-    // 撤銷紀錄：第 0 格永遠是原圖，所以可以一路復原回原圖
+    // 撤銷紀錄（存成 Blob，不佔 canvas 記憶體）：第 0 格永遠是原圖，所以可以一路復原回原圖
     const history = edited ? [original, edited] : [original];
     const hIndex = history.length - 1;
-    // 原圖已在匯入時限制 4096；保險起見再限制一次
-    const { canvas } = await img.decodeToCanvas(history[hIndex], img.MAX_SIDE);
-    ed = {
-      listingId, photoId, photo,
-      history, hIndex, savedIndex: hIndex,
-      engine: sessionEngine || settings.defaultEngine,
-      busy: false, timer: null,
-      compareCanvas: null, holding: false,
-    };
+    // 舊版存的照片可能是 4096，這裡縮到工作尺寸（2560）再修
+    ({ canvas } = await img.decodeToCanvas(history[hIndex], workMax));
     editor.enabled = true;
     editor.setImage(canvas);
+    ed = {
+      listingId: photo.listingId, photoId, photo,
+      history, hIndex, savedIndex: hIndex,
+      engine: sessionEngine || settings.defaultEngine,
+      busy: false,
+      compareCanvas: null, holding: false,
+    };
+    canvas = null;
     edEls.hint.classList.remove('faded');
+    setTool('paint');
     setEngine(ed.engine, { silent: true });
+    updateNav();
     updateEditorUI();
+    if (!settings.tutorialSeen) {
+      settings.tutorialSeen = true;
+      showTutorial();
+    }
     return true;
   } catch (e) {
-    ui.alert('無法開啟照片', eng.errorMessage(e));
+    if (canvas) img.releaseCanvas(canvas);
+    const working = editor.image;
+    editor.release();
+    img.releaseCanvas(working);
     ed = null;
+    showError('無法開啟照片', e);
     return false;
   } finally {
     busy.close();
@@ -534,27 +691,48 @@ async function openEditor(listingId, photoId) {
 
 function closeEditor() {
   if (!ed) return;
-  clearTimeout(ed.timer);
-  if (unsubModel) { unsubModel(); unsubModel = null; }
   img.releaseCanvas(ed.compareCanvas);
+  ed.compareCanvas = null;
   const working = editor.image;
   editor.release();
   img.releaseCanvas(working);
   ed = null;
-  edEls.banner.hidden = true;
   edEls.busy.hidden = true;
+  edEls.compareTag.hidden = true;
+  refreshModelUI();
+}
+
+/** 這張在案件中的位置 */
+function photoIndex() {
+  if (!ed) return -1;
+  return (cur.photos || []).findIndex((p) => p.id === ed.photoId);
+}
+
+function updateNav() {
+  const list = cur.photos || [];
+  const i = photoIndex();
+  const b = !ed || ed.busy;
+  edEls.counter.textContent = i >= 0 ? `${i + 1} / ${list.length}` : '';
+  edEls.prev.disabled = b || i <= 0;
+  edEls.next.disabled = b || i < 0 || i >= list.length - 1;
 }
 
 function updateEditorUI() {
   if (!ed) return;
   const b = ed.busy;
-  edEls.undo.disabled = b || ed.hIndex <= 0;
-  edEls.redo.disabled = b || ed.hIndex >= ed.history.length - 1;
+  const painted = editor.hasMask();
+  edEls.undo.disabled = b || (!editor.strokes.length && ed.hIndex <= 0);
+  edEls.redo.disabled = b || painted || ed.hIndex >= ed.history.length - 1;
   edEls.compare.disabled = b;
+  edEls.clear.disabled = b || !editor.strokes.length;
   edEls.declutter.disabled = b;
+  edEls.remove.disabled = b || !painted;
+  edEls.remove.textContent = painted ? '✨ 移除' : '先塗抹要移除的東西';
   edEls.save.disabled = b;
   edEls.save.classList.toggle('dirty', isDirty());
   for (const s of edEls.seg) s.disabled = b;
+  for (const t of edEls.tools) t.disabled = b;
+  updateNav();
 }
 
 /** 處理中遮罩（畫面上） */
@@ -575,6 +753,12 @@ function stageProgress(fallback) {
   };
 }
 
+// ---------- 塗抹／橡皮擦 ----------
+function setTool(t) {
+  editor.setTool(t);
+  for (const b of edEls.tools) b.setAttribute('aria-checked', String(b.dataset.tool === editor.tool));
+}
+
 // ---------- 修圖方式切換 ----------
 function setEngine(engine, { silent = false } = {}) {
   if (!ed) return;
@@ -582,14 +766,9 @@ function setEngine(engine, { silent = false } = {}) {
   sessionEngine = engine;
   for (const s of edEls.seg) s.setAttribute('aria-checked', String(s.dataset.engine === engine));
   edEls.declutter.hidden = engine !== 'gemini';
-  if (engine === 'local') {
-    startModelPreload();
-  } else {
-    edEls.banner.hidden = true;
-    if (!settings.apiKey && !silent) askForKey();
-  }
-  // 切換後，若還有塗抹沒處理，就用新的方式處理
-  if (!silent && editor.hasMask()) scheduleRun();
+  if (engine === 'local') preloadModel();
+  else if (!settings.apiKey && !silent) askForKey();
+  refreshModelUI();
 }
 
 async function askForKey() {
@@ -605,108 +784,56 @@ async function askForKey() {
   else if (c === 'local' || !settings.apiKey) setEngine('local', { silent: true });
 }
 
-// ---------- 本機模型預先下載 ----------
-function startModelPreload() {
-  if (!ed || ed.engine !== 'local') return;
-  const status = eng.localModelStatus();
-  if (status === 'ready') { edEls.banner.hidden = true; return; }
-  const firstTime = !settings.modelLoadedOnce;
-  const textEl = edEls.banner.querySelector('.ed-banner-text');
-  const bar = edEls.banner.querySelector('.progress');
-  const barFill = edEls.banner.querySelector('.progress-bar');
-  const title = firstTime ? '首次使用需下載 AI 模型，約 30MB（只需一次）' : '正在準備 AI 模型…';
-
-  edEls.banner.classList.remove('error');
-  edEls.banner.onclick = null;
-  textEl.textContent = title;
-  bar.hidden = false;
-  bar.classList.add('indeterminate');
-  edEls.banner.hidden = false;
-
-  if (unsubModel) unsubModel();
-  unsubModel = eng.onModelProgress((p) => {
-    if (!ed || ed.engine !== 'local') return;
-    const d = eng.describeProgress(p, '準備中');
-    if (d.ratio != null) {
-      bar.classList.remove('indeterminate');
-      barFill.style.width = Math.round(d.ratio * 100) + '%';
-      textEl.textContent = `${title}　${Math.round(d.ratio * 100)}%`;
-    }
-  });
-
-  eng.ensureLocalModel().then(() => {
-    settings.modelLoadedOnce = true;
-    if (unsubModel) { unsubModel(); unsubModel = null; }
-    edEls.banner.hidden = true;
-    if (firstTime && ed) ui.toast('AI 模型已就緒，之後不用再下載');
-  }).catch((e) => {
-    if (unsubModel) { unsubModel(); unsubModel = null; }
-    if (!ed || ed.engine !== 'local') return;
-    edEls.banner.classList.add('error');
-    textEl.textContent = `AI 模型載入失敗：${eng.errorMessage(e)}（點這裡重試）`;
-    bar.hidden = true;
-    edEls.banner.hidden = false;
-    edEls.banner.onclick = () => startModelPreload();
-  });
-}
-
-// ---------- 塗抹後自動移除 ----------
-editor.onStrokeStart = () => {
-  if (ed) clearTimeout(ed.timer);
-  edEls.hint.classList.add('faded');
-};
-editor.onStrokeEnd = () => scheduleRun();
+// ---------- 塗抹（不會自動移除，要按「✨ 移除」） ----------
+editor.onStrokeStart = () => { edEls.hint.classList.add('faded'); };
+editor.onStrokeEnd = () => updateEditorUI();
+editor.onMaskChange = () => updateEditorUI();
 editor.onViewChange = (atFit) => { edEls.fit.hidden = atFit; };
 
-function scheduleRun() {
-  if (!ed) return;
-  clearTimeout(ed.timer);
-  ed.timer = setTimeout(runRemoval, AUTO_RUN_DELAY);
-}
-
+/** 執行移除。成功回傳 true */
 async function runRemoval() {
-  if (!ed || ed.busy || !editor.hasMask()) return;
-  // 還有手指在畫面上（正在畫下一筆）就晚點再跑
-  if (editor.pointers.size > 0) { scheduleRun(); return; }
-
-  if (ed.engine === 'gemini' && !settings.apiKey) { askForKey(); return; }
+  if (!ed || ed.busy) return false;
+  if (!editor.hasMask() || editor.maskIsEmpty()) {
+    ui.toast('請先用手指把要移除的東西塗成紅色');
+    return false;
+  }
+  if (ed.engine === 'gemini' && !settings.apiKey) { askForKey(); return false; }
 
   const session = ed;
   session.busy = true;
   editor.enabled = false;
   updateEditorUI();
   stageBusy(true, '準備中…');
+  let failure = null;
+  let ok = false;
   try {
     let result;
-    const source = editor.image;
-    const mask = editor.getMask();
     if (session.engine === 'local') {
       if (eng.localModelStatus() !== 'ready') {
-        const off = eng.onModelProgress(stageProgress('下載 AI 模型中（第一次約 30MB）'));
-        stageBusy(true, '準備 AI 模型中…');
+        // AI 還沒準備好：顯示進度，準備好後自動繼續
+        const off = eng.onModelProgress(stageProgress('AI 準備中（準備好會自動開始）'));
+        stageBusy(true, 'AI 準備中（準備好會自動開始）…');
         try { await eng.ensureLocalModel(); } finally { off(); }
         settings.modelLoadedOnce = true;
-        edEls.banner.hidden = true;
+        refreshModelUI();
+        if (ed !== session) return false;
       }
       const mod = await eng.getLocalEngine();
       stageBusy(true, 'AI 正在移除雜物…');
-      result = await mod.inpaintLocal(source, mask, stageProgress('AI 正在移除雜物…'));
+      result = await mod.inpaintLocal(editor.image, editor.getMask(), stageProgress('AI 正在移除雜物…'));
     } else {
       const g = await eng.getGeminiEngine();
       stageBusy(true, '傳送到 Gemini 處理中…');
-      result = await g.inpaintGemini(source, mask, {
+      result = await g.inpaintGemini(editor.image, editor.getMask(), {
         apiKey: settings.apiKey,
         onProgress: stageProgress('Gemini 處理中…'),
       });
     }
-    if (ed !== session) return; // 處理期間已離開畫面
+    if (ed !== session) { if (result) img.releaseCanvas(result); return false; } // 處理期間已離開畫面
     await commitResult(result);
+    ok = true;
   } catch (e) {
-    console.error(e);
-    if (ed === session) {
-      editor.clearMask();
-      ui.alert('移除失敗', eng.errorMessage(e) + '\n\n塗抹已清除，可以重新塗一次再試。');
-    }
+    failure = e;
   } finally {
     session.busy = false;
     if (ed === session) {
@@ -715,6 +842,42 @@ async function runRemoval() {
       updateEditorUI();
     }
   }
+  if (failure && ed === session) await handleRemovalError(failure);
+  return ok;
+}
+
+/** 移除失敗：顯示原因；記憶體不足時提供「用較小尺寸再試」 */
+async function handleRemovalError(e) {
+  console.error(e);
+  if (!ed) return;
+  const canShrink = ed.engine === 'local' && eng.isMemoryError(e) && editor.image
+    && Math.max(editor.image.width, editor.image.height) > img.SMALL_SIDE;
+  if (canShrink) {
+    const v = await showError('移除失敗', e, {
+      hint: MEMORY_HINT + '\n\n也可以改用較小的尺寸（1920）再試一次，上架畫質仍然足夠。',
+      buttons: [
+        { label: '用較小尺寸再試一次', value: 'small', primary: true },
+        { label: '取消', value: null },
+      ],
+    });
+    if (v !== 'small' || !ed) return;
+    workMax = img.SMALL_SIDE;
+    try { editor.downscaleTo(img.SMALL_SIDE); }
+    catch (err) { showError('無法縮小照片', err); return; }
+    // 原圖預覽也一起丟掉，之後用小尺寸重新產生
+    img.releaseCanvas(ed.compareCanvas);
+    ed.compareCanvas = null;
+    runRemoval();
+    return;
+  }
+  const v = await showError('移除失敗', e, {
+    hint: (eng.isMemoryError(e) ? MEMORY_HINT + '\n\n' : '') + '紅色塗抹還保留著，可以直接再試一次。',
+    buttons: [
+      { label: '再試一次', value: 'retry', primary: true },
+      { label: '關閉', value: null },
+    ],
+  });
+  if (v === 'retry' && ed) runRemoval();
 }
 
 /** 把 AI 結果變成新的工作影像，並加入撤銷紀錄 */
@@ -739,24 +902,31 @@ async function commitResult(resultCanvas) {
 }
 
 // ---------- 復原 / 重做 ----------
+async function undo() {
+  if (!ed || ed.busy) return;
+  // 先復原塗抹，沒有塗抹才復原 AI 結果
+  if (editor.undoStroke()) return;
+  await stepHistory(-1);
+}
+
 async function stepHistory(delta) {
   if (!ed || ed.busy) return;
   const ni = ed.hIndex + delta;
   if (ni < 0 || ni >= ed.history.length) return;
-  clearTimeout(ed.timer);
   const session = ed;
   session.busy = true;
   updateEditorUI();
   try {
-    const { canvas } = await img.decodeToCanvas(session.history[ni], img.MAX_SIDE);
+    // 先放掉目前的工作影像，再解碼下一個（同時只留一張大圖在記憶體）
+    const { canvas } = await img.decodeToCanvas(session.history[ni], workMax);
     if (ed !== session) { img.releaseCanvas(canvas); return; }
     const old = editor.image;
     editor.setImage(canvas, { keepView: true });
-    img.releaseCanvas(old);
+    if (old && old !== canvas) img.releaseCanvas(old);
     session.hIndex = ni;
     ui.toast(ni === 0 ? '已回到原圖' : (delta < 0 ? '已復原' : '已重做'), 1200);
   } catch (e) {
-    ui.alert('操作失敗', eng.errorMessage(e));
+    showError('操作失敗', e);
   } finally {
     session.busy = false;
     updateEditorUI();
@@ -767,17 +937,18 @@ async function stepHistory(delta) {
 async function compareStart(e) {
   if (!ed || ed.busy) return;
   e.preventDefault();
-  try { edEls.compare.setPointerCapture(e.pointerId); } catch { /* 忽略 */ }
+  try { if (e.pointerId !== undefined) edEls.compare.setPointerCapture(e.pointerId); } catch { /* 忽略 */ }
   ed.holding = true;
   edEls.compare.classList.add('pressed');
   const session = ed;
   if (!session.compareCanvas) {
     try {
       // 比較用的原圖只需要螢幕解析度，省記憶體
-      const { canvas } = await img.decodeToCanvas(session.history[0], 2048);
+      const side = Math.min(2048, workMax);
+      const { canvas } = await img.decodeToCanvas(session.history[0], side);
       if (ed !== session) { img.releaseCanvas(canvas); return; }
       session.compareCanvas = canvas;
-    } catch (err) { console.error(err); return; }
+    } catch (err) { console.error(err); ui.toast('無法顯示原圖（記憶體不足）'); return; }
   }
   if (ed === session && session.holding) {
     editor.setCompare(session.compareCanvas);
@@ -805,13 +976,13 @@ async function declutterFlow() {
     ],
   });
   if (ok !== true || !ed) return;
-  clearTimeout(ed.timer);
   editor.clearMask();
   const session = ed;
   session.busy = true;
   editor.enabled = false;
   updateEditorUI();
   stageBusy(true, '傳送到 Gemini 處理中…');
+  let failure = null;
   try {
     const g = await eng.getGeminiEngine();
     const result = await g.declutterGemini(editor.image, {
@@ -822,8 +993,7 @@ async function declutterFlow() {
     await commitResult(result);
     ui.toast('整理完成，請檢查結果；不滿意可按「復原」', 3500);
   } catch (e) {
-    console.error(e);
-    if (ed === session) ui.alert('一鍵整理失敗', eng.errorMessage(e));
+    failure = e;
   } finally {
     session.busy = false;
     if (ed === session) {
@@ -832,6 +1002,7 @@ async function declutterFlow() {
       updateEditorUI();
     }
   }
+  if (failure && ed === session) showError('一鍵整理失敗', failure);
 }
 
 // ---------- 儲存 ----------
@@ -851,28 +1022,89 @@ async function saveEdit() {
       await db.saveEdited(ed.photoId, blob, thumb);
     }
     ed.savedIndex = ed.hIndex;
+    const p = (cur.photos || []).find((x) => x.id === ed.photoId);
+    if (p) p.edited = ed.hIndex !== 0;
     updateEditorUI();
     return true;
   } catch (e) {
-    ui.alert('儲存失敗', eng.errorMessage(e));
+    showError('儲存失敗', e);
     return false;
   } finally {
     busy.close();
+    maybeReloadForUpdate();
   }
 }
 
-async function saveAndLeave() {
-  if (!ed) return;
-  if (editor.hasMask() && !ed.busy) {
-    // 還有塗了但沒處理的區域 → 先處理
-    clearTimeout(ed.timer);
-    await runRemoval();
-    if (!ed) return;
+/** 按「儲存」：（有未移除的塗抹先問）→ 儲存 → 問要不要去下一張沒整理的 */
+async function saveFlow() {
+  if (!ed || ed.busy) return;
+  if (hasPendingMask()) {
+    const v = await ui.dialog({
+      title: '塗抹的地方還沒移除',
+      message: '紅色的地方還沒按「✨ 移除」。要先移除再儲存嗎？',
+      buttons: [
+        { label: '✨ 先移除再儲存', value: 'run', primary: true },
+        { label: '不移除，直接儲存', value: 'skip' },
+        { label: '取消', value: null },
+      ],
+    });
+    if (!v || !ed) return;
+    if (v === 'run') { if (!(await runRemoval())) return; }
+    else editor.clearMask();
   }
+  if (!ed) return;
   const wasDirty = isDirty();
   if (!(await saveEdit())) return;
-  if (wasDirty) ui.toast('已儲存 ✓');
-  goBack();
+  if (wasDirty) ui.toast('已儲存 ✓', 1500);
+  await offerNext();
+}
+
+/** 儲存後：提供跳到下一張還沒整理的照片 */
+async function offerNext() {
+  if (!ed) return;
+  const list = cur.photos || [];
+  const i = photoIndex();
+  let next = null;
+  for (let k = 1; k <= list.length; k++) {
+    const p = list[((i < 0 ? -1 : i) + k + list.length) % list.length];
+    if (p && p.id !== ed.photoId && !p.edited) { next = p; break; }
+  }
+  if (!next) {
+    if (!list.every((p) => p.edited)) return; // 只剩這張沒整理（例如沒有修改就按儲存）：留在這張
+    await ui.alert('全部整理好了 ✓', `這個案件的 ${list.length || 1} 張照片都整理過了。\n回到照片牆後，可以按「全部匯出」。`);
+    if (ed) goBack();
+    return;
+  }
+  const n = list.indexOf(next) + 1;
+  const v = await ui.dialog({
+    title: '已儲存 ✓',
+    message: `下一張還沒整理的是第 ${n} 張，要直接開啟嗎？`,
+    buttons: [
+      { label: `開啟第 ${n} 張`, value: 'next', primary: true },
+      { label: '回到照片牆', value: 'back' },
+      { label: '留在這張', value: null },
+    ],
+  });
+  if (!ed) return;
+  if (v === 'next') openPhotoInEditor(next.id);
+  else if (v === 'back') goBack();
+}
+
+function openPhotoInEditor(photoId) {
+  if (!ed) return;
+  // 用 replace：按返回會回到照片牆，不會一張一張倒退
+  navigate({ screen: 'editor', listingId: ed.listingId, photoId }, { replace: true });
+}
+
+/** 上一張／下一張 */
+async function gotoPhoto(delta) {
+  if (!ed || ed.busy) return;
+  const list = cur.photos || [];
+  const i = photoIndex();
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= list.length) return;
+  if (!(await confirmLeave())) return;
+  openPhotoInEditor(list[j].id);
 }
 
 // ---------- 綁定修圖畫面按鈕 ----------
@@ -881,11 +1113,25 @@ function bindEditor() {
     if (!ed || ed.busy || ed.engine === b.dataset.engine) return;
     setEngine(b.dataset.engine);
   }));
-  edEls.save.addEventListener('click', saveAndLeave);
-  edEls.undo.addEventListener('click', () => stepHistory(-1));
+  edEls.tools.forEach((b) => b.addEventListener('click', () => {
+    if (!ed || ed.busy) return;
+    setTool(b.dataset.tool);
+    if (b.dataset.tool === 'erase') ui.toast('橡皮擦：塗過的地方可以擦掉紅色', 1600);
+  }));
+  edEls.save.addEventListener('click', saveFlow);
+  edEls.remove.addEventListener('click', () => runRemoval());
+  edEls.undo.addEventListener('click', undo);
   edEls.redo.addEventListener('click', () => stepHistory(1));
+  edEls.clear.addEventListener('click', () => {
+    if (!ed || ed.busy) return;
+    editor.clearMask();
+    setTool('paint');
+  });
   edEls.declutter.addEventListener('click', declutterFlow);
   edEls.fit.addEventListener('click', () => editor.fit());
+  edEls.prev.addEventListener('click', () => gotoPhoto(-1));
+  edEls.next.addEventListener('click', () => gotoPhoto(1));
+  edEls.help.addEventListener('click', () => showTutorial());
 
   const cmp = edEls.compare;
   cmp.addEventListener('pointerdown', compareStart);
@@ -925,6 +1171,7 @@ async function openSettings() {
   $('#set-apikey-result').className = 'key-result';
   $('#set-watermark').checked = settings.watermark;
   for (const r of document.querySelectorAll('input[name="default-engine"]')) r.checked = r.value === settings.defaultEngine;
+  $('#app-version').textContent = `版本 ${APP_VERSION}`;
   renderAbout();
 }
 
@@ -942,6 +1189,7 @@ async function renderAbout() {
     const info = await eng.localEngineInfo();
     if (info) parts.push(`本機 AI：${info.name || '已載入'}（${info.backend === 'webgpu' ? 'WebGPU 加速' : 'WASM'}）。`);
   }
+  if (workMax < img.MAX_SIDE) parts.push(`目前使用省記憶體模式（${workMax}px）。`);
   $('#about-info').textContent = parts.join(' ');
 }
 
@@ -974,7 +1222,8 @@ function bindSettings() {
       const g = await eng.getGeminiEngine();
       const r = await g.testGeminiKey(k);
       const ok = !!(r && r.ok);
-      result.textContent = (ok ? '✓ ' : '✗ ') + ((r && r.message) || (ok ? '金鑰可以使用' : '金鑰無法使用'));
+      const m = r && r.message && /[一-鿿]/.test(r.message) ? r.message : (ok ? '金鑰可以使用' : '金鑰無法使用');
+      result.textContent = (ok ? '✓ ' : '✗ ') + m;
       result.className = 'key-result ' + (ok ? 'ok' : 'fail');
     } catch (err) {
       result.textContent = '✗ ' + eng.errorMessage(err);
@@ -996,6 +1245,7 @@ function bindSettings() {
     });
   }
   $('#compliance-text').replaceChildren(complianceNode());
+  $('#app-version').textContent = `版本 ${APP_VERSION}`;
 }
 
 // =========================================================
@@ -1022,24 +1272,52 @@ function bindMain() {
   $('#btn-take-photo').addEventListener('click', () => inCamera.click());
   for (const input of [inPhotos, inCamera]) {
     input.addEventListener('change', async () => {
-      const files = input.files;
-      await importFiles(files);
+      const files = [...(input.files || [])];
       input.value = ''; // 讓同一張可以再選一次
+      try { await importFiles(files); }
+      catch (e) { showError('加入照片失敗', e); }
     });
   }
   $('#btn-export-all').addEventListener('click', exportAll);
 }
 
 // =========================================================
-// 啟動
+// Service Worker 與自動更新
 // =========================================================
+let swReg = null;
+let updatePending = false;
+let reloading = false;
+
+/** 有新版時：沒有未儲存的修改才重新載入（只重新載入一次） */
+function maybeReloadForUpdate() {
+  if (!updatePending || reloading) return;
+  if (ed && (isDirty() || ed.busy || hasPendingMask())) return;
+  reloading = true;
+  location.reload();
+}
+
 async function registerSW() {
   if (!('serviceWorker' in navigator)) return;
   try {
     // 先確認 sw.js 存在，避免 404 時在主控台噴錯
     const r = await fetch('./sw.js', { method: 'HEAD', cache: 'no-store' });
     if (!r.ok) return;
-    await navigator.serviceWorker.register('./sw.js');
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      // 第一次安裝（原本沒有 controller）不需要重新載入
+      if (!hadController || reloading || updatePending) return;
+      updatePending = true;
+      if (ed && (isDirty() || ed.busy || hasPendingMask())) {
+        ui.toast('有新版本，儲存後會自動更新', 4000);
+      } else {
+        maybeReloadForUpdate();
+      }
+    });
+    swReg = await navigator.serviceWorker.register('./sw.js');
+    try { await swReg.update(); } catch { /* 離線時忽略 */ }
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && swReg) swReg.update().catch(() => {});
+    });
   } catch (e) {
     console.info('Service worker 未註冊：', e && e.message);
   }
@@ -1075,6 +1353,5 @@ async function init() {
 }
 
 init().catch((e) => {
-  console.error(e);
-  ui.alert('啟動失敗', eng.errorMessage(e));
+  showError('啟動失敗', e, { hint: '請把修圖器完全關掉再重新開啟。' });
 });

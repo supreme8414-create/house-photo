@@ -5,14 +5,32 @@
 //   https://huggingface.co/andraniksargsyan/migan  → migan_pipeline_v2.onnx（28,079,181 bytes）
 //   輸入  image: uint8 [1,3,H,W]（RGB, 0..255, NCHW, H/W 可變）
 //         mask : uint8 [1,1,H,W]（255 = 保留、0 = 要補的洞）
-//   輸出  result: uint8 [1,3,H,W]（整張圖，洞已補好；內部自行裁切 / 縮到 512 / 羽化貼回）
+//   輸出  result: uint8 [1,3,H,W]
 // 備用模型（選用）：Carve/LaMa-ONNX lama_fp32.onnx（約 208MB，固定 512×512，float32）
-//   image float32 [1,3,512,512] 0..1；mask float32 [1,1,512,512] 1 = 洞；output float32 [1,3,512,512]（Clip 後，約 0..255）
+//
+// iOS Safari 注意事項（本檔的設計重點）：
+//  - iOS 一律只用 WASM（ort.wasm.min.mjs，約 11MB 的 wasm，比 WebGPU 版 22MB 省記憶體）；
+//    MI-GAN 的 uint8 + ScatterND + 動態尺寸在 iOS WebGPU 上不穩定。
+//  - Safari 限制畫布總記憶體（數百 MB）與單張面積（約 16.7MP），超過時 getContext 會回傳 null。
+//    本檔只配置「一張」全尺寸輸出畫布；遮罩分析與裁切取樣都用分段 getImageData 讀取，
+//    不另外產生全尺寸或大尺寸的暫存畫布；模型工作尺寸 ≤ 512。
+//  - 所有丟出的錯誤都是 Error：.message 為繁中友善訊息，.code 為錯誤類型，.detail 保留原始英文。
 
 const ORT_VERSION = '1.22.0';
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
-const ORT_URL = ORT_BASE + 'ort.webgpu.min.mjs'; // 內含 WebGPU + WASM 兩種後端
+// 已確認存在於 jsDelivr（1.22.0/dist）：
+//   ort.wasm.min.mjs   → 使用 ort-wasm-simd-threaded.mjs + ort-wasm-simd-threaded.wasm（約 11.2MB）
+//   ort.webgpu.min.mjs → 使用 ort-wasm-simd-threaded.jsep.mjs + ort-wasm-simd-threaded.jsep.wasm（約 21.9MB）
+const ORT_WASM_URL = ORT_BASE + 'ort.wasm.min.mjs';
+const ORT_WEBGPU_URL = ORT_BASE + 'ort.webgpu.min.mjs';
 const CACHE_NAME = 'house-ai-models-v1';
+
+const IS_IOS = (() => {
+  try {
+    const ua = navigator.userAgent || '';
+    return /iP(hone|ad|od)/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+  } catch { return false; }
+})();
 
 export const LOCAL_MODELS = {
   migan: {
@@ -37,14 +55,21 @@ export const LOCAL_MODELS = {
 
 let currentModelId = 'migan';
 let ortModule = null;
+let ortBundle = null;        // 'wasm' | 'webgpu'（實際載入的 ORT 套件）
+let ortImportAttempts = 0;
 let session = null;
-let backend = 'wasm';
-let loadPromise = null;
+let sessionBackend = 'wasm'; // 目前 session 的後端
+let backend = 'wasm';        // 對外回報
 let ready = false;
+let loadPromise = null;      // 進行中的載入（失敗後會清掉，下次可重試）
+let generation = 0;          // releaseSession 時遞增，作廢進行中的舊載入
+let preferWasm = IS_IOS;     // WebGPU 失敗過一次就固定用 WASM
+let lastError = null;        // 最近一次錯誤的原始英文細節
+let inferQueue = Promise.resolve(); // 推論排隊，避免同時跑兩次
 
 /** 選用：切換模型（'migan' | 'lama'）。切換後需重新 loadLocalModel。 */
 export function selectLocalModel(id) {
-  if (!LOCAL_MODELS[id]) throw new Error('未知的模型：' + id);
+  if (!LOCAL_MODELS[id]) throw engineError('MODEL_INIT', '未知的模型：' + id, 'unknown model id ' + id);
   if (id === currentModelId) return;
   currentModelId = id;
   releaseSession();
@@ -52,48 +77,133 @@ export function selectLocalModel(id) {
 
 export function getLocalEngineInfo() {
   const m = LOCAL_MODELS[currentModelId];
-  return { name: m.name, backend, ready, model: m.file, ortVersion: ORT_VERSION };
+  return {
+    name: m.name, backend, ready, model: m.file, ortVersion: ORT_VERSION,
+    ortBundle, platform: IS_IOS ? 'ios' : 'other', lastError,
+  };
 }
 
-// ───────────────────────── 錯誤訊息 ─────────────────────────
+// ───────────────────────── 錯誤 ─────────────────────────
 
-class FriendlyError extends Error {
-  constructor(message, cause) {
-    super(message);
+const FRIENDLY = {
+  MODEL_DOWNLOAD: 'AI 模型下載失敗，請確認網路連線後再試一次。',
+  MODEL_INIT: 'AI 引擎啟動失敗。請關閉其他 App，或完全關閉後重新開啟本 App 再試。',
+  OUT_OF_MEMORY: '手機記憶體不足，AI 無法完成。請關閉其他 App（必要時完全關閉後重新開啟本 App）再試，或把要移除的範圍塗小一點。',
+  CANVAS: '照片太大，手機記憶體不足以處理。請關閉其他 App 或重新開啟本 App 後再試。',
+  INFERENCE: 'AI 修圖失敗，請重試；若一直失敗，請改用強力模式。',
+  MASK: '遮罩尺寸與照片不符，請重新塗抹。',
+};
+
+class LocalEngineError extends Error {
+  constructor(code, message, detail, cause) {
+    super(message || FRIENDLY[code] || FRIENDLY.INFERENCE);
     this.name = 'LocalEngineError';
+    this.code = code;
+    this.detail = detail || null;
     this.friendly = true;
-    if (cause) this.cause = cause;
+    if (cause !== undefined) this.cause = cause;
   }
 }
 
-function isMemoryError(e) {
-  const s = String((e && (e.message || e)) || '');
-  return e instanceof RangeError || /memory|OOM|allocat|Aborted|out of bounds/i.test(s);
+function engineError(code, message, detail, cause) {
+  return new LocalEngineError(code, message, detail, cause);
 }
 
-function toFriendly(e, fallbackMsg) {
-  if (e && e.friendly) return e;
-  if (isMemoryError(e)) return new FriendlyError('手機記憶體不足，請關閉其他 App 後重試（或把要移除的範圍塗小一點）。', e);
-  return new FriendlyError(fallbackMsg, e);
+/** 把任何丟出的東西轉成「名稱: 訊息 + 前幾行 stack」字串 */
+function errDetail(e, depth = 0) {
+  if (e == null) return 'unknown error (' + e + ')';
+  if (e instanceof LocalEngineError && e.detail) return e.detail;
+  let name, msg;
+  if (typeof e === 'object') {
+    name = e.name || (e.constructor && e.constructor.name) || 'Object';
+    msg = e.message != null ? String(e.message) : safeString(e);
+  } else {
+    name = typeof e; msg = String(e);
+  }
+  let s = `${name}: ${msg}`;
+  if (e && e.stack) {
+    const lines = String(e.stack).split('\n').filter((l) => l.trim()).slice(0, 4);
+    if (lines.length) s += '\n' + lines.join('\n');
+  }
+  if (e && e.cause && depth < 3) s += '\n← ' + errDetail(e.cause, depth + 1);
+  return s;
+}
+
+function safeString(x) {
+  try { return JSON.stringify(x); } catch { try { return String(x); } catch { return '?'; } }
+}
+
+const RE_OOM = /out of memory|array buffer allocation failed|allocation failed|could not allocate|cannot enlarge memory|failed to grow|bad_alloc|RangeError|Aborted\(|memory access out of bounds|out of bounds memory access|\bOOM\b/i;
+const RE_CANVAS = /null is not an object|cannot read propert(y|ies) of null|getContext|InvalidStateError|invalid state|canvas/i;
+const RE_DOWNLOAD = /load failed|failed to fetch|networkerror|network connection|network error|importing a module script failed|dynamically imported module|HTTP \d{3}|invalid model bytes|not a model file/i;
+const RE_INIT = /no available backend|WebAssembly|\bwasm\b|backend|InferenceSession|failed to create session|session/i;
+
+/** 只取「名稱: 訊息」（含 cause），不含 stack，避免函式名稱（如 makeCanvas）誤判分類 */
+function classText(e, depth = 0) {
+  if (e == null) return '';
+  let s;
+  if (typeof e === 'object') {
+    s = `${e.name || ''}: ${e.message != null ? e.message : safeString(e)}`;
+    if (e.cause && depth < 3) s += ' | ' + classText(e.cause, depth + 1);
+  } else s = String(e);
+  return s;
+}
+
+/** 依原始錯誤文字分類 → LocalEngineError（已是 LocalEngineError 則原樣回傳） */
+function normalize(e, defaultCode) {
+  if (e instanceof LocalEngineError) return e;
+  const detail = errDetail(e);
+  const s = classText(e);
+  let code = defaultCode;
+  if (RE_OOM.test(s)) code = 'OUT_OF_MEMORY';
+  else if (defaultCode === 'INFERENCE' && RE_CANVAS.test(s)) code = 'CANVAS'; // 載入階段不會碰畫布
+  else if (RE_DOWNLOAD.test(s)) code = 'MODEL_DOWNLOAD';
+  else if (defaultCode !== 'INFERENCE' && RE_INIT.test(s)) code = 'MODEL_INIT';
+  return engineError(code, FRIENDLY[code], detail, e);
 }
 
 function log(...a) { console.log('[local-ai]', ...a); }
 
-// ───────────────────────── 模型載入 ─────────────────────────
+function sleep0() { return new Promise((r) => setTimeout(r, 0)); }
+
+function withTimeout(p, ms, label) {
+  let t = null;
+  const timer = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(label + ' timed out after ' + ms + 'ms')), ms); });
+  return Promise.race([p, timer]).finally(() => clearTimeout(t));
+}
+
+// ───────────────────────── ORT 與模型載入 ─────────────────────────
 
 async function loadOrt() {
   if (ortModule) return ortModule;
-  try {
-    ortModule = await import(ORT_URL);
-  } catch (e) {
-    throw new FriendlyError('AI 引擎載入失敗，請確認網路連線後重試。', e);
+  const urls = IS_IOS ? [ORT_WASM_URL] : [ORT_WEBGPU_URL, ORT_WASM_URL];
+  let lastErr = null;
+  for (const base of urls) {
+    // 失敗過的模組網址可能被瀏覽器記住，重試時加查詢字串
+    const url = ortImportAttempts > 0 ? `${base}?retry=${ortImportAttempts}` : base;
+    ortImportAttempts++;
+    try {
+      const mod = await import(url);
+      const ort = mod && mod.InferenceSession ? mod : (mod && mod.default) || mod;
+      if (!ort || !ort.InferenceSession || !ort.env) throw new Error('onnxruntime-web module has no InferenceSession');
+      ort.env.wasm.wasmPaths = ORT_BASE;
+      // GitHub Pages 沒有 cross-origin isolation → 只能單執行緒；iOS 一律單執行緒以省記憶體
+      const hc = navigator.hardwareConcurrency || 1;
+      ort.env.wasm.numThreads = (self.crossOriginIsolated === true && !IS_IOS) ? Math.max(1, Math.min(4, hc)) : 1;
+      ort.env.wasm.proxy = false;
+      ortModule = ort;
+      ortBundle = base === ORT_WASM_URL ? 'wasm' : 'webgpu';
+      if (ortBundle === 'wasm') preferWasm = true;
+      log('ORT loaded', url, 'threads', ort.env.wasm.numThreads, 'ios', IS_IOS);
+      return ort;
+    } catch (e) {
+      lastErr = e;
+      console.warn('[local-ai] ORT 載入失敗', url, e);
+    }
   }
-  const ort = ortModule;
-  ort.env.wasm.wasmPaths = ORT_BASE;
-  const hc = navigator.hardwareConcurrency || 1;
-  ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.max(1, Math.min(4, hc)) : 1;
-  ort.env.wasm.proxy = false;
-  return ort;
+  const err = normalize(lastErr, 'MODEL_DOWNLOAD');
+  if (err.code === 'MODEL_INIT') err.message = 'AI 引擎載入失敗，請確認網路連線後重試。';
+  throw err;
 }
 
 function cacheAvailable() {
@@ -105,7 +215,7 @@ async function readWithProgress(resp, onProgress, expected) {
   const total = Number(resp.headers.get('content-length')) || expected || 0;
   if (!resp.body || !resp.body.getReader) {
     const buf = new Uint8Array(await resp.arrayBuffer());
-    onProgress && onProgress({ loaded: buf.byteLength, total: buf.byteLength, stage: 'download' });
+    onProgress({ loaded: buf.byteLength, total: buf.byteLength, stage: 'download' });
     return buf;
   }
   const reader = resp.body.getReader();
@@ -124,9 +234,9 @@ async function readWithProgress(resp, onProgress, expected) {
     } else chunks.push(value);
     loaded += value.byteLength;
     const now = performance.now();
-    if (onProgress && now - lastReport > 100) { lastReport = now; onProgress({ loaded, total, stage: 'download' }); }
+    if (now - lastReport > 100) { lastReport = now; onProgress({ loaded, total, stage: 'download' }); }
   }
-  onProgress && onProgress({ loaded, total: total || loaded, stage: 'download' });
+  onProgress({ loaded, total: total || loaded, stage: 'download' });
   if (buf) return loaded === buf.byteLength ? buf : buf.slice(0, loaded);
   const out = new Uint8Array(loaded);
   let o = 0;
@@ -151,16 +261,19 @@ async function fetchModelBytes(model, onProgress) {
       cache = await caches.open(CACHE_NAME);
       const hit = await cache.match(cacheKey);
       if (hit) {
-        onProgress && onProgress({ loaded: 0, total: model.size, stage: 'cache' });
+        onProgress({ loaded: 0, total: model.size, stage: 'cache' });
         const bytes = new Uint8Array(await hit.arrayBuffer());
         if (looksLikeOnnx(bytes, model)) {
-          onProgress && onProgress({ loaded: bytes.byteLength, total: bytes.byteLength, stage: 'cache' });
+          onProgress({ loaded: bytes.byteLength, total: bytes.byteLength, stage: 'cache' });
           log('model from Cache Storage', bytes.byteLength);
           return bytes;
         }
         await cache.delete(cacheKey);
       }
-    } catch (e) { console.warn('[local-ai] Cache Storage 無法使用', e); cache = null; }
+    } catch (e) {
+      if (RE_OOM.test(classText(e))) throw normalize(e, 'OUT_OF_MEMORY');
+      console.warn('[local-ai] Cache Storage 無法使用', e); cache = null;
+    }
   }
 
   const sources = [new URL('../models/' + model.file, import.meta.url).href, model.hfUrl];
@@ -168,21 +281,25 @@ async function fetchModelBytes(model, onProgress) {
   for (const url of sources) {
     try {
       const resp = await fetch(url, { cache: 'no-cache' });
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + url);
       const ct = resp.headers.get('content-type') || '';
-      if (/text\/html/i.test(ct)) throw new Error('not a model file (' + ct + ')');
+      if (/text\/html/i.test(ct)) throw new Error('not a model file (' + ct + ') ' + url);
       const b = await readWithProgress(resp, onProgress, model.size);
-      if (!looksLikeOnnx(b, model)) throw new Error('invalid model bytes (' + b.byteLength + ')');
+      if (!looksLikeOnnx(b, model)) throw new Error('invalid model bytes (' + b.byteLength + ') ' + url);
       bytes = b;
       log('model downloaded from', url, b.byteLength);
       break;
     } catch (e) {
       lastErr = e;
       console.warn('[local-ai] 模型來源失敗', url, e);
-      if (isMemoryError(e)) throw toFriendly(e);
+      if (RE_OOM.test(classText(e))) throw normalize(e, 'OUT_OF_MEMORY');
     }
   }
-  if (!bytes) throw new FriendlyError('模型下載失敗，請確認網路連線後重試。', lastErr);
+  if (!bytes) {
+    const err = normalize(lastErr, 'MODEL_DOWNLOAD');
+    if (err.code !== 'OUT_OF_MEMORY') { err.code = 'MODEL_DOWNLOAD'; err.message = FRIENDLY.MODEL_DOWNLOAD; }
+    throw err;
+  }
 
   if (cache) {
     try {
@@ -196,88 +313,121 @@ async function fetchModelBytes(model, onProgress) {
 
 async function hasWebGPU() {
   try {
-    if (!navigator.gpu) return false;
-    const adapter = await navigator.gpu.requestAdapter();
+    if (IS_IOS || !navigator.gpu) return false;
+    const adapter = await withTimeout(navigator.gpu.requestAdapter(), 3000, 'requestAdapter');
     return !!adapter;
   } catch { return false; }
 }
 
-async function createSession(ort, bytes, ep) {
-  return ort.InferenceSession.create(bytes, {
+function sessionOptions(ep) {
+  return {
     executionProviders: [ep],
     graphOptimizationLevel: 'all',
-  });
+    executionMode: 'sequential',
+    // 記憶體配置模式（mem pattern）會依「每種輸入尺寸」預先規劃並保留一整塊記憶體；
+    // 我們每次裁切尺寸都不同（動態 H/W），開著反而會累積多份規劃、提高峰值 → 關閉。
+    enableMemPattern: false,
+    // CPU arena 會成塊保留記憶體且不歸還；iOS 記憶體上限低，關閉以壓低峰值（速度略慢，512 尺寸影響很小）。
+    enableCpuMemArena: !IS_IOS,
+  };
 }
 
 function releaseSession() {
   const s = session;
+  generation++;
   session = null; ready = false; loadPromise = null;
-  if (s && s.release) s.release().catch(() => {});
+  if (s && s.release) {
+    try { Promise.resolve(s.release()).catch(() => {}); } catch { /* 忽略 */ }
+  }
 }
 
-async function doLoad(onProgress, forceWasm) {
+/** 實際載入：回傳 {session, backend}；錯誤一律為 LocalEngineError */
+async function doLoad(progress) {
   const model = LOCAL_MODELS[currentModelId];
   const ort = await loadOrt();
-  const bytes = await fetchModelBytes(model, onProgress);
-  onProgress && onProgress({ loaded: bytes.byteLength, total: bytes.byteLength, stage: 'init' });
+  let bytes = await fetchModelBytes(model, progress);
+  progress({ loaded: bytes.byteLength, total: bytes.byteLength, stage: 'init' });
+  await sleep0(); // 讓進度文字先畫出來
   const t0 = performance.now();
-  let s = null;
-  if (!forceWasm && await hasWebGPU()) {
-    try {
-      s = await createSession(ort, bytes, 'webgpu');
-      backend = 'webgpu';
-    } catch (e) {
-      console.warn('[local-ai] WebGPU 初始化失敗，改用 WASM', e);
-      s = null;
+  let s = null, be = 'wasm';
+  try {
+    if (!preferWasm && ortBundle === 'webgpu' && await hasWebGPU()) {
+      try {
+        s = await withTimeout(ort.InferenceSession.create(bytes, sessionOptions('webgpu')), 60000, 'webgpu session create');
+        be = 'webgpu';
+      } catch (e) {
+        console.warn('[local-ai] WebGPU 初始化失敗，改用 WASM', e);
+        preferWasm = true;
+        s = null;
+      }
     }
-  }
-  if (!s) {
-    try {
-      s = await createSession(ort, bytes, 'wasm');
-      backend = 'wasm';
-    } catch (e) {
-      throw toFriendly(e, 'AI 模型初始化失敗，請重新整理頁面再試。');
+    if (!s) {
+      try {
+        s = await ort.InferenceSession.create(bytes, sessionOptions('wasm'));
+        be = 'wasm';
+      } catch (e) {
+        throw normalize(e, 'MODEL_INIT');
+      }
     }
+  } finally {
+    bytes = null; // 模型已複製進 wasm 記憶體，放掉 JS 端的 28MB
   }
-  log(`session ready: ${model.file} on ${backend} in ${Math.round(performance.now() - t0)}ms`,
+  log(`session ready: ${model.file} on ${be} in ${Math.round(performance.now() - t0)}ms`,
     'inputs', s.inputNames, 'outputs', s.outputNames, 'threads', ort.env.wasm.numThreads);
-  session = s;
-  ready = true;
-  onProgress && onProgress({ loaded: 1, total: 1, stage: 'ready' });
-  return session;
+  return { session: s, backend: be };
 }
 
-/** 預先載入模型；可重複呼叫（同一個 Promise）。onProgress({loaded,total,stage}) */
 const progressListeners = new Set();
-function broadcast(p) {
-  for (const fn of progressListeners) { try { fn(p); } catch (e) { console.warn(e); } }
-}
+const READY_EVT = { loaded: 1, total: 1, stage: 'ready' };
+function safeCall(fn, p) { try { fn(p); } catch (e) { console.warn(e); } }
+function broadcast(p) { for (const fn of progressListeners) safeCall(fn, p); }
 
-export function loadLocalModel(onProgress) {
-  if (ready && loadPromise) {
-    onProgress && onProgress({ loaded: 1, total: 1, stage: 'ready' });
-    return loadPromise;
+/** 取得（必要時載入）session。同時呼叫共用同一個 Promise；失敗後下次會重新嘗試。 */
+function ensureSession(onProgress) {
+  if (ready && session) {
+    if (onProgress) safeCall(onProgress, READY_EVT);
+    return Promise.resolve(session);
   }
   if (onProgress) progressListeners.add(onProgress);
   if (!loadPromise) {
-    loadPromise = doLoad(broadcast, false)
-      .catch((e) => {
-        loadPromise = null;
-        throw toFriendly(e, 'AI 模型載入失敗，請稍後再試。');
-      })
-      .finally(() => progressListeners.clear());
+    const gen = generation;
+    const p = (async () => {
+      const r = await doLoad(broadcast);
+      if (gen !== generation) { // 載入期間被 releaseSession 作廢（例如切換模型）
+        try { Promise.resolve(r.session.release()).catch(() => {}); } catch { /* 忽略 */ }
+        return null;
+      }
+      session = r.session; sessionBackend = r.backend; backend = r.backend; ready = true;
+      broadcast(READY_EVT);
+      return session;
+    })();
+    loadPromise = p;
+    p.then(
+      () => { progressListeners.clear(); },
+      () => { if (loadPromise === p) loadPromise = null; progressListeners.clear(); },
+    );
   }
-  return loadPromise;
+  return loadPromise.then(
+    (s) => s || ensureSession(onProgress),
+    (e) => { const err = normalize(e, 'MODEL_INIT'); lastError = err.detail; throw err; },
+  );
 }
 
-async function fallbackToWasm(onProgress) {
-  log('falling back to WASM backend');
-  releaseSession();
-  loadPromise = doLoad(onProgress, true).catch((e) => { loadPromise = null; throw toFriendly(e, 'AI 模型載入失敗，請稍後再試。'); });
-  return loadPromise;
+/** 預先載入模型；可重複呼叫（共用同一個 Promise）。onProgress({loaded,total,stage}) */
+export async function loadLocalModel(onProgress) {
+  try {
+    await ensureSession(onProgress);
+    return getLocalEngineInfo();
+  } catch (e) {
+    const err = normalize(e, 'MODEL_INIT');
+    lastError = err.detail;
+    throw err;
+  }
 }
 
 // ───────────────────────── 影像工具 ─────────────────────────
+
+const STRIP_BYTES = 4 * 1024 * 1024; // 分段讀取像素，每段約 4MB
 
 function makeCanvas(w, h) {
   const c = document.createElement('canvas');
@@ -286,29 +436,23 @@ function makeCanvas(w, h) {
   return c;
 }
 
-function ctx2d(c, readback) {
-  return c.getContext('2d', readback ? { willReadFrequently: true } : undefined);
+function freeCanvas(c) {
+  if (c) { try { c.width = 0; c.height = 0; } catch { /* 忽略 */ } }
 }
 
-/** 把 src 的 (sx,sy,sw,sh) 區域縮放到 dw×dh；大幅縮小時逐次減半，避免細筆畫消失、鋸齒 */
-function scaleRegion(src, sx, sy, sw, sh, dw, dh) {
-  dw = Math.max(1, Math.round(dw)); dh = Math.max(1, Math.round(dh));
-  let cur = src, cx = sx, cy = sy, cw = sw, ch = sh;
-  while (cw / 2 >= dw && ch / 2 >= dh) {
-    const nw = Math.round(cw / 2), nh = Math.round(ch / 2);
-    const c = makeCanvas(nw, nh);
-    const g = ctx2d(c);
-    g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
-    g.drawImage(cur, cx, cy, cw, ch, 0, 0, nw, nh);
-    if (cur !== src) { cur.width = cur.height = 0; }
-    cur = c; cx = 0; cy = 0; cw = nw; ch = nh;
+/** 取得 2D context；Safari 超過畫布記憶體上限時會回傳 null → 丟出友善錯誤 */
+function getCtx(c, readback, what) {
+  let g = null;
+  try { g = c.getContext('2d', readback ? { willReadFrequently: true } : undefined); } catch { g = null; }
+  if (!g) {
+    throw engineError('CANVAS', FRIENDLY.CANVAS,
+      `getContext('2d') returned null for ${what} canvas ${c.width}x${c.height} (canvas memory limit?)`);
   }
-  const out = makeCanvas(dw, dh);
-  const g = ctx2d(out, true);
-  g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
-  g.drawImage(cur, cx, cy, cw, ch, 0, 0, dw, dh);
-  if (cur !== src) { cur.width = cur.height = 0; }
-  return out;
+  return g;
+}
+
+function stripRows(width) {
+  return Math.max(1, Math.floor(STRIP_BYTES / (Math.max(1, width) * 4)));
 }
 
 /** 二值遮罩方形膨脹（可分離 max filter），m: Uint8Array 0/1 */
@@ -318,7 +462,7 @@ function dilate(m, w, h, r) {
   const out = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     const row = y * w;
-    let last = -1e9; // 最近一個 1 的位置（向左掃）
+    let last = -1e9;
     for (let x = 0; x < w; x++) { if (m[row + x]) last = x; if (x - last <= r) tmp[row + x] = 1; }
     last = 1e9;
     for (let x = w - 1; x >= 0; x--) { if (m[row + x]) last = x; if (last - x <= r) tmp[row + x] = 1; }
@@ -332,10 +476,10 @@ function dilate(m, w, h, r) {
   return out;
 }
 
-/** 盒狀模糊（3 次近似高斯），輸入 Float32Array 0..1 */
+/** 盒狀模糊（3 次近似高斯），輸入 Float32Array 0..1（就地修改） */
 function boxBlur(src, w, h, r, passes = 3) {
   if (r <= 0) return src;
-  let a = src, b = new Float32Array(w * h);
+  const a = src, b = new Float32Array(w * h);
   const n = 2 * r + 1;
   for (let p = 0; p < passes; p++) {
     for (let y = 0; y < h; y++) { // 水平
@@ -358,21 +502,106 @@ function boxBlur(src, w, h, r, passes = 3) {
   return a;
 }
 
+/**
+ * 從 ctx 的 (x,y,cw,ch) 區域取樣成 ww×wh 的 RGBA（alpha=255）。
+ * 縮小時用分段 getImageData + 區域平均（不建立任何大畫布）；放大（僅 LaMa 小圖）才用小畫布。
+ */
+function sampleRegionRGBA(srcCtx, x, y, cw, ch, ww, wh) {
+  const n = ww * wh;
+  if (ww > cw || wh > ch) {
+    const c = makeCanvas(ww, wh);
+    try {
+      const g = getCtx(c, true, 'sample');
+      g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+      g.drawImage(srcCtx.canvas, x, y, cw, ch, 0, 0, ww, wh);
+      const d = g.getImageData(0, 0, ww, wh).data;
+      for (let i = 3; i < d.length; i += 4) d[i] = 255;
+      return d;
+    } finally { freeCanvas(c); }
+  }
+  const sum = new Uint32Array(n * 3);
+  const cnt = new Uint32Array(n);
+  const xmap = new Int32Array(cw);
+  for (let sx = 0; sx < cw; sx++) xmap[sx] = Math.min(ww - 1, Math.floor((sx * ww) / cw));
+  const rows = stripRows(cw);
+  for (let sy0 = 0; sy0 < ch; sy0 += rows) {
+    const rh = Math.min(rows, ch - sy0);
+    const d = srcCtx.getImageData(x, y + sy0, cw, rh).data;
+    for (let r = 0; r < rh; r++) {
+      const rowBase = Math.min(wh - 1, Math.floor(((sy0 + r) * wh) / ch)) * ww;
+      let i = r * cw * 4;
+      for (let sx = 0; sx < cw; sx++, i += 4) {
+        const c = rowBase + xmap[sx];
+        const c3 = c * 3;
+        sum[c3] += d[i]; sum[c3 + 1] += d[i + 1]; sum[c3 + 2] += d[i + 2];
+        cnt[c]++;
+      }
+    }
+  }
+  const out = new Uint8ClampedArray(n * 4);
+  for (let c = 0; c < n; c++) {
+    const k = cnt[c] || 1, c3 = c * 3, o = c * 4;
+    out[o] = sum[c3] / k; out[o + 1] = sum[c3 + 1] / k; out[o + 2] = sum[c3 + 2] / k; out[o + 3] = 255;
+  }
+  return out;
+}
+
+/**
+ * 遮罩 (x,y,cw,ch) 區域 → ww×wh 的 0/1 陣列。
+ * 用「任一像素 R>127 即為洞」的最大值池化，細筆畫縮小後也不會消失。
+ */
+function sampleRegionMask(maskCtx, x, y, cw, ch, ww, wh) {
+  const m = new Uint8Array(ww * wh);
+  const xlo = new Int32Array(cw), xhi = new Int32Array(cw);
+  for (let sx = 0; sx < cw; sx++) {
+    const lo = Math.min(ww - 1, Math.floor((sx * ww) / cw));
+    xlo[sx] = lo;
+    xhi[sx] = Math.min(ww - 1, Math.max(lo, Math.ceil(((sx + 1) * ww) / cw) - 1));
+  }
+  const rows = stripRows(cw);
+  for (let sy0 = 0; sy0 < ch; sy0 += rows) {
+    const rh = Math.min(rows, ch - sy0);
+    const d = maskCtx.getImageData(x, y + sy0, cw, rh).data;
+    for (let r = 0; r < rh; r++) {
+      const sy = sy0 + r;
+      const ylo = Math.min(wh - 1, Math.floor((sy * wh) / ch));
+      const yhi = Math.min(wh - 1, Math.max(ylo, Math.ceil(((sy + 1) * wh) / ch) - 1));
+      let i = r * cw * 4;
+      for (let sx = 0; sx < cw; sx++, i += 4) {
+        if (d[i] > 127) {
+          for (let cy = ylo; cy <= yhi; cy++) {
+            const row = cy * ww;
+            for (let cx = xlo[sx]; cx <= xhi[sx]; cx++) m[row + cx] = 1;
+          }
+        }
+      }
+    }
+  }
+  return m;
+}
+
 // ───────────────────────── 遮罩分析 ─────────────────────────
 
 const MAP_MAX = 1024;
 
-/** 在縮小的遮罩圖上找連通區塊，回傳原圖座標的外框陣列 */
-function findMaskRegions(maskCanvas, W, H) {
-  const f = Math.max(1, Math.max(W, H) / MAP_MAX);
-  const mw = Math.max(1, Math.round(W / f)), mh = Math.max(1, Math.round(H / f));
-  const small = scaleRegion(maskCanvas, 0, 0, W, H, mw, mh);
-  const d = ctx2d(small, true).getImageData(0, 0, mw, mh).data;
-  small.width = small.height = 0;
-  const thr = f > 1 ? 8 : 127; // 縮小後細筆畫會變淡，用低門檻
+/** 在縮小的遮罩圖（最大值池化）上找連通區塊，回傳原圖座標的外框陣列 */
+function findMaskRegions(maskCtx, W, H) {
+  const f = Math.max(1, Math.ceil(Math.max(W, H) / MAP_MAX));
+  const mw = Math.ceil(W / f), mh = Math.ceil(H / f);
   const m = new Uint8Array(mw * mh);
   let any = false;
-  for (let i = 0; i < m.length; i++) if (d[i * 4] > thr) { m[i] = 1; any = true; }
+  const rows = stripRows(W);
+  for (let y0 = 0; y0 < H; y0 += rows) {
+    const rh = Math.min(rows, H - y0);
+    const d = maskCtx.getImageData(0, y0, W, rh).data;
+    for (let r = 0; r < rh; r++) {
+      const row = (((y0 + r) / f) | 0) * mw;
+      let i = r * W * 4;
+      for (let x = 0; x < W; x++, i += 4) {
+        if (d[i] > 127) { m[row + ((x / f) | 0)] = 1; any = true; }
+      }
+    }
+  }
   if (!any) return [];
 
   const label = new Int32Array(mw * mh);
@@ -387,7 +616,10 @@ function findMaskRegions(maskCanvas, W, H) {
     while (sp) {
       const p = stack[--sp];
       const px = p % mw, py = (p / mw) | 0;
-      if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py;
+      if (px < x0) x0 = px;
+      if (px > x1) x1 = px;
+      if (py < y0) y0 = py;
+      if (py > y1) y1 = py;
       for (let dy = -1; dy <= 1; dy++) {
         const ny = py + dy; if (ny < 0 || ny >= mh) continue;
         for (let dx = -1; dx <= 1; dx++) {
@@ -398,8 +630,8 @@ function findMaskRegions(maskCanvas, W, H) {
       }
     }
     boxes.push({
-      x0: Math.max(0, Math.floor((x0 - 1) * f)), y0: Math.max(0, Math.floor((y0 - 1) * f)),
-      x1: Math.min(W, Math.ceil((x1 + 2) * f)), y1: Math.min(H, Math.ceil((y1 + 2) * f)),
+      x0: Math.max(0, (x0 - 1) * f), y0: Math.max(0, (y0 - 1) * f),
+      x1: Math.min(W, (x1 + 2) * f), y1: Math.min(H, (y1 + 2) * f),
     });
   }
   return boxes;
@@ -425,7 +657,7 @@ function overlaps(a, b) {
 
 /** 合併裁切區重疊的區塊，回傳不重疊的裁切區 */
 function planCrops(boxes, W, H) {
-  let crops = boxes.map((b) => cropForBox(b, W, H));
+  const crops = boxes.map((b) => cropForBox(b, W, H));
   let merged = true;
   while (merged) {
     merged = false;
@@ -450,176 +682,186 @@ function planCrops(boxes, W, H) {
 // 以「模型工作解析度」的像素為單位
 const INFER_DILATE = 12; // 推論前把洞擴張（雜物邊緣、陰影）
 const COMP_DILATE = 6;   // 貼回時的遮罩擴張
-const COMP_BLUR = 2;     // 羽化半徑（3 次盒狀模糊，影響範圍約 3×2=6 ≤ COMP_DILATE，原本的洞內 alpha 維持 1）
+const COMP_BLUR = 2;     // 羽化半徑（3 次盒狀模糊，影響範圍約 6 ≤ COMP_DILATE，原本的洞內 alpha 維持 1）
 
-async function runModel(model, rgba, hole, w, h) {
+/** 跑一次模型，回傳 RGBA Uint8ClampedArray（w×h，alpha=255）。張量一律在 finally 釋放。 */
+async function runModel(s, model, rgba, hole, w, h) {
   const ort = ortModule;
   const n = w * h;
-  let feeds, outName;
-  if (model.kind === 'migan-pipeline') {
-    const img = new Uint8Array(3 * n);
-    const msk = new Uint8Array(n);
-    for (let i = 0; i < n; i++) {
-      img[i] = rgba[i * 4]; img[n + i] = rgba[i * 4 + 1]; img[2 * n + i] = rgba[i * 4 + 2];
-      msk[i] = hole[i] ? 0 : 255; // MI-GAN：0 = 洞，255 = 保留
-    }
-    feeds = {
-      image: new ort.Tensor('uint8', img, [1, 3, h, w]),
-      mask: new ort.Tensor('uint8', msk, [1, 1, h, w]),
-    };
-    outName = 'result';
-  } else { // LaMa 固定 512×512
-    const img = new Float32Array(3 * n);
-    const msk = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      img[i] = rgba[i * 4] / 255; img[n + i] = rgba[i * 4 + 1] / 255; img[2 * n + i] = rgba[i * 4 + 2] / 255;
-      msk[i] = hole[i] ? 1 : 0;
-    }
-    feeds = {
-      image: new ort.Tensor('float32', img, [1, 3, h, w]),
-      mask: new ort.Tensor('float32', msk, [1, 1, h, w]),
-    };
-    outName = 'output';
-  }
-  const names = session.inputNames || [];
-  if (names.length === 2 && !names.includes('image')) { // 保險：名稱不同時依順序對應
-    feeds = { [names[0]]: feeds.image, [names[1]]: feeds.mask };
-  }
-  const results = await session.run(feeds);
-  for (const t of Object.values(feeds)) t.dispose && t.dispose();
-  const outT = results[outName] || results[session.outputNames[0]];
-  const data = outT.getData ? await outT.getData() : outT.data;
-  const dims = outT.dims;
-  for (const t of Object.values(results)) t.dispose && t.dispose();
-
-  // 轉回 RGBA
-  const oh = dims[2], ow = dims[3];
-  if (ow !== w || oh !== h) throw new Error(`unexpected output dims ${dims}`);
-  let scale = 1;
-  if (!(data instanceof Uint8Array)) {
-    let mx = 0;
-    for (let i = 0; i < data.length; i += 97) if (data[i] > mx) mx = data[i];
-    scale = mx <= 1.5 ? 255 : 1;
-  }
-  const out = new Uint8ClampedArray(n * 4);
-  for (let i = 0; i < n; i++) {
-    out[i * 4] = data[i] * scale;
-    out[i * 4 + 1] = data[n + i] * scale;
-    out[i * 4 + 2] = data[2 * n + i] * scale;
-    out[i * 4 + 3] = 255;
-  }
-  return out;
-}
-
-async function runWithFallback(model, rgba, hole, w, h, onProgress) {
+  let feeds = {};
+  let results = null;
   try {
-    return await runModel(model, rgba, hole, w, h);
-  } catch (e) {
-    if (backend === 'webgpu' && !isMemoryError(e)) {
-      console.warn('[local-ai] WebGPU 推論失敗，改用 WASM 重試', e);
-      await fallbackToWasm((p) => onProgress && onProgress({ ...p, stage: 'load' }));
-      return await runModel(model, rgba, hole, w, h);
+    let outName;
+    if (model.kind === 'migan-pipeline') {
+      const img = new Uint8Array(3 * n);
+      const msk = new Uint8Array(n);
+      for (let i = 0; i < n; i++) {
+        img[i] = rgba[i * 4]; img[n + i] = rgba[i * 4 + 1]; img[2 * n + i] = rgba[i * 4 + 2];
+        msk[i] = hole[i] ? 0 : 255; // MI-GAN：0 = 洞，255 = 保留
+      }
+      feeds.image = new ort.Tensor('uint8', img, [1, 3, h, w]);
+      feeds.mask = new ort.Tensor('uint8', msk, [1, 1, h, w]);
+      outName = 'result';
+    } else { // LaMa 固定 512×512
+      const img = new Float32Array(3 * n);
+      const msk = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        img[i] = rgba[i * 4] / 255; img[n + i] = rgba[i * 4 + 1] / 255; img[2 * n + i] = rgba[i * 4 + 2] / 255;
+        msk[i] = hole[i] ? 1 : 0;
+      }
+      feeds.image = new ort.Tensor('float32', img, [1, 3, h, w]);
+      feeds.mask = new ort.Tensor('float32', msk, [1, 1, h, w]);
+      outName = 'output';
     }
-    throw e;
+    const names = s.inputNames || [];
+    if (names.length === 2 && !names.includes('image')) { // 保險：名稱不同時依順序對應
+      feeds = { [names[0]]: feeds.image, [names[1]]: feeds.mask };
+    }
+    results = await s.run(feeds);
+    const outT = results[outName] || results[(s.outputNames || [])[0]];
+    if (!outT) throw new Error('model returned no output tensor');
+    const data = (outT.location && outT.location !== 'cpu' && outT.getData) ? await outT.getData() : outT.data;
+    const dims = outT.dims;
+    const oh = dims[2], ow = dims[3];
+    if (ow !== w || oh !== h || !data || data.length < 3 * n) throw new Error(`unexpected output dims ${dims}`);
+
+    let scale = 1;
+    if (!(data instanceof Uint8Array)) {
+      let mx = 0;
+      for (let i = 0; i < data.length; i += 97) if (data[i] > mx) mx = data[i];
+      scale = mx <= 1.5 ? 255 : 1;
+    }
+    const out = new Uint8ClampedArray(n * 4);
+    for (let i = 0; i < n; i++) {
+      out[i * 4] = data[i] * scale;
+      out[i * 4 + 1] = data[n + i] * scale;
+      out[i * 4 + 2] = data[2 * n + i] * scale;
+      out[i * 4 + 3] = 255;
+    }
+    return out;
+  } finally {
+    for (const t of Object.values(feeds)) { try { t && t.dispose && t.dispose(); } catch { /* 忽略 */ } }
+    if (results) {
+      for (const t of Object.values(results)) { try { t && t.dispose && t.dispose(); } catch { /* 忽略 */ } }
+    }
   }
 }
 
-/** 處理單一裁切區，直接畫回 out 畫布 */
-async function inpaintCrop(out, maskCanvas, crop, model, onProgress) {
+/** 推論；WebGPU 在執行時失敗（含 device lost 等被拒絕的 Promise、逾時）→ 透明地改用 WASM 重跑 */
+async function runWithFallback(model, rgba, hole, w, h, onProgress) {
+  const s = await ensureSession(); // inpaintJob 已確保載入，這裡不重複回報進度
+  const be = sessionBackend;
+  try {
+    const p = runModel(s, model, rgba, hole, w, h);
+    return await (be === 'webgpu' ? withTimeout(p, 60000, 'webgpu run') : p);
+  } catch (e) {
+    if (be !== 'webgpu') throw e;
+    console.warn('[local-ai] WebGPU 推論失敗，改用 WASM 重試', e);
+    preferWasm = true;
+    if (session === s) releaseSession();
+    const s2 = await ensureSession(onProgress);
+    return await runModel(s2, model, rgba, hole, w, h);
+  }
+}
+
+/** 處理單一裁切區，直接畫回 out 畫布（只建立一張 ≤512 的小畫布） */
+async function inpaintCrop(og, maskCtx, crop, model, onProgress) {
   const { x, y, w: cw, h: ch } = crop;
-  const fixed = model.kind === 'lama-fixed512';
   let ww, wh;
-  if (fixed) { ww = wh = model.workSize; }
+  if (model.kind === 'lama-fixed512') { ww = wh = model.workSize; }
   else {
     const s = Math.min(1, model.workSize / Math.max(cw, ch));
     ww = Math.max(8, Math.round(cw * s)); wh = Math.max(8, Math.round(ch * s));
   }
-  const sc = Math.max(cw / ww, ch / wh); // 1 個工作像素 ≈ sc 個原圖像素
 
   // 取圖（從目前的 out 取，前一個區塊修好的結果也能當參考）
-  const imgC = scaleRegion(out, x, y, cw, ch, ww, wh);
-  const rgba = ctx2d(imgC, true).getImageData(0, 0, ww, wh).data;
-  imgC.width = imgC.height = 0;
-
-  const mC = scaleRegion(maskCanvas, x, y, cw, ch, ww, wh);
-  const md = ctx2d(mC, true).getImageData(0, 0, ww, wh).data;
-  mC.width = mC.height = 0;
-  const thr = sc > 1.01 ? 20 : 127;
-  const hole0 = new Uint8Array(ww * wh);
-  for (let i = 0; i < hole0.length; i++) hole0[i] = md[i * 4] > thr ? 1 : 0;
-
+  const rgba = sampleRegionRGBA(og, x, y, cw, ch, ww, wh);
+  const hole0 = sampleRegionMask(maskCtx, x, y, cw, ch, ww, wh);
   const holeInfer = dilate(hole0, ww, wh, INFER_DILATE);
+
   const t0 = performance.now();
   const res = await runWithFallback(model, rgba, holeInfer, ww, wh, onProgress);
   log(`inference ${ww}x${wh} (crop ${cw}x${ch} @ ${x},${y}) ${Math.round(performance.now() - t0)}ms on ${backend}`);
 
-  // 結果 → 畫布 → 放大到裁切區大小
-  const resC = makeCanvas(ww, wh);
-  ctx2d(resC).putImageData(new ImageData(res, ww, wh), 0, 0);
-
-  // 羽化 alpha（工作解析度計算，放大時再自然平滑）
+  // 羽化 alpha 直接寫進結果的 alpha 通道（工作解析度；放大時自然平滑）
   const comp = dilate(hole0, ww, wh, COMP_DILATE);
   const af = new Float32Array(ww * wh);
   for (let i = 0; i < af.length; i++) af[i] = comp[i];
   boxBlur(af, ww, wh, COMP_BLUR);
-  const ad = new Uint8ClampedArray(ww * wh * 4);
   for (let i = 0; i < af.length; i++) {
     const a = hole0[i] ? 1 : af[i]; // 原本的洞一定完全覆蓋
-    ad[i * 4] = ad[i * 4 + 1] = ad[i * 4 + 2] = 255; ad[i * 4 + 3] = a * 255;
+    res[i * 4 + 3] = a * 255;
   }
-  const alphaC = makeCanvas(ww, wh);
-  ctx2d(alphaC).putImageData(new ImageData(ad, ww, wh), 0, 0);
 
-  const patch = makeCanvas(cw, ch);
-  const pg = ctx2d(patch);
-  pg.imageSmoothingEnabled = true; pg.imageSmoothingQuality = 'high';
-  pg.drawImage(resC, 0, 0, ww, wh, 0, 0, cw, ch);
-  pg.globalCompositeOperation = 'destination-in';
-  pg.drawImage(alphaC, 0, 0, ww, wh, 0, 0, cw, ch);
-  resC.width = resC.height = 0; alphaC.width = alphaC.height = 0;
+  const patch = makeCanvas(ww, wh);
+  try {
+    getCtx(patch, false, 'patch').putImageData(new ImageData(res, ww, wh), 0, 0);
+    og.save();
+    og.globalCompositeOperation = 'source-over';
+    og.globalAlpha = 1;
+    og.imageSmoothingEnabled = true; og.imageSmoothingQuality = 'high';
+    og.drawImage(patch, 0, 0, ww, wh, x, y, cw, ch);
+    og.restore();
+  } finally {
+    freeCanvas(patch);
+  }
+}
 
-  const og = ctx2d(out);
-  og.globalCompositeOperation = 'source-over';
-  og.drawImage(patch, x, y);
-  patch.width = patch.height = 0;
+async function inpaintJob(imageCanvas, maskCanvas, onProgress) {
+  const report = (stage, loaded = 0, total = 1) => { if (onProgress) safeCall(onProgress, { stage, loaded, total }); };
+  let out = null;
+  const T0 = performance.now();
+  try {
+    if (!imageCanvas) throw engineError('CANVAS', FRIENDLY.CANVAS, 'imageCanvas is missing');
+    const W = imageCanvas.naturalWidth || imageCanvas.width, H = imageCanvas.naturalHeight || imageCanvas.height;
+    if (!W || !H) throw engineError('CANVAS', FRIENDLY.CANVAS, `image has zero size ${W}x${H}`);
+    if (!maskCanvas || maskCanvas.width !== W || maskCanvas.height !== H) {
+      throw engineError('MASK', FRIENDLY.MASK,
+        `mask size ${maskCanvas ? maskCanvas.width + 'x' + maskCanvas.height : 'none'} != image ${W}x${H}`);
+    }
+    report('prepare');
+    const maskCtx = getCtx(maskCanvas, false, 'mask');
+    const boxes = findMaskRegions(maskCtx, W, H);
+    const crops = boxes.length ? planCrops(boxes, W, H) : [];
+    if (crops.length) {
+      log(`${W}x${H}, ${boxes.length} mask region(s) → ${crops.length} crop(s)`, crops.map((c) => `${c.w}x${c.h}@${c.x},${c.y}`));
+      // 模型可能還在下載/初始化：共用同一個載入 Promise
+      await ensureSession(onProgress);
+    }
+    const model = LOCAL_MODELS[currentModelId];
+
+    // 唯一一張全尺寸畫布（輸出），在模型就緒後才配置以降低峰值
+    out = makeCanvas(W, H);
+    const og = getCtx(out, true, 'output');
+    og.drawImage(imageCanvas, 0, 0);
+
+    for (let i = 0; i < crops.length; i++) {
+      report('infer', i, crops.length);
+      await inpaintCrop(og, maskCtx, crops[i], model, onProgress);
+      await sleep0(); // 讓畫面有機會更新
+    }
+    report('done', crops.length || 1, crops.length || 1);
+    log(`total ${Math.round(performance.now() - T0)}ms`);
+    const result = out;
+    out = null;
+    return result;
+  } catch (e) {
+    const err = normalize(e, 'INFERENCE');
+    lastError = err.detail;
+    console.error('[local-ai] inpaint failed', err.code, err.detail);
+    throw err;
+  } finally {
+    freeCanvas(out); // 只有失敗時 out 仍不為 null
+  }
 }
 
 /**
  * imageCanvas、maskCanvas 尺寸相同；mask 白色(R>127)=要移除。
  * 回傳新的 canvas（尺寸＝原圖），遮罩外的像素保持原樣。
+ * 多次呼叫會排隊依序執行；模型尚未載入完成時會等待同一個載入。
  */
-export async function inpaintLocal(imageCanvas, maskCanvas, onProgress) {
-  const W = imageCanvas.width, H = imageCanvas.height;
-  if (!maskCanvas || maskCanvas.width !== W || maskCanvas.height !== H) {
-    throw new FriendlyError('遮罩尺寸與照片不符，請重新塗抹。');
-  }
-  const report = (stage, loaded = 0, total = 1) => onProgress && onProgress({ stage, loaded, total });
-
-  const out = makeCanvas(W, H);
-  ctx2d(out).drawImage(imageCanvas, 0, 0);
-
-  const T0 = performance.now();
-  try {
-    report('prepare');
-    const boxes = findMaskRegions(maskCanvas, W, H);
-    if (!boxes.length) { report('done', 1, 1); return out; }
-    const crops = planCrops(boxes, W, H);
-    log(`${W}x${H}, ${boxes.length} mask region(s) → ${crops.length} crop(s)`, crops.map((c) => `${c.w}x${c.h}@${c.x},${c.y}`));
-
-    await loadLocalModel(onProgress);
-    const model = LOCAL_MODELS[currentModelId];
-
-    for (let i = 0; i < crops.length; i++) {
-      report('infer', i, crops.length);
-      await inpaintCrop(out, maskCanvas, crops[i], model, onProgress);
-      await new Promise((r) => setTimeout(r, 0)); // 讓畫面有機會更新
-    }
-    report('done', crops.length, crops.length);
-    log(`total ${Math.round(performance.now() - T0)}ms`);
-    return out;
-  } catch (e) {
-    out.width = out.height = 0;
-    console.error('[local-ai] inpaint failed', e);
-    throw toFriendly(e, 'AI 修圖失敗，請重試；若一直失敗，請改用強力模式。');
-  }
+export function inpaintLocal(imageCanvas, maskCanvas, onProgress) {
+  const job = inferQueue.then(() => inpaintJob(imageCanvas, maskCanvas, onProgress));
+  inferQueue = job.then(() => {}, () => {});
+  return job;
 }
