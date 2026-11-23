@@ -9,7 +9,7 @@ const FILES = [
   './engine/local.js', './engine/gemini.js',
   './lib/db.js', './lib/image.js', './lib/editor.js', './lib/engines.js',
   './lib/export.js', './lib/ui.js', './lib/settings.js',
-  './lib/errors.js', './lib/tutorial.js',
+  './lib/errors.js', './lib/tutorial.js', './lib/aiui.js',
   './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
 ];

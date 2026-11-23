@@ -91,16 +91,21 @@
           <p>按下方「相簿選照片」或「拍照」加入。<br>點照片就能開始修圖。</p>
         </div>
       </main>
-      <footer class="bottombar three">
-        <button id="btn-add-photos" class="btn" type="button">
-          <svg aria-hidden="true"><use href="#i-photo"/></svg>相簿選照片
+      <footer class="bottombar stacked">
+        <button id="btn-batch-ai" class="btn accent-outline block" type="button">
+          <svg aria-hidden="true"><use href="#i-sparkle"/></svg>全部一鍵清除
         </button>
-        <button id="btn-take-photo" class="btn" type="button">
-          <svg aria-hidden="true"><use href="#i-camera"/></svg>拍照
-        </button>
-        <button id="btn-export-all" class="btn primary" type="button">
-          <svg aria-hidden="true"><use href="#i-share"/></svg>全部匯出
-        </button>
+        <div class="bar-row">
+          <button id="btn-add-photos" class="btn" type="button">
+            <svg aria-hidden="true"><use href="#i-photo"/></svg>相簿選照片
+          </button>
+          <button id="btn-take-photo" class="btn" type="button">
+            <svg aria-hidden="true"><use href="#i-camera"/></svg>拍照
+          </button>
+          <button id="btn-export-all" class="btn primary" type="button">
+            <svg aria-hidden="true"><use href="#i-share"/></svg>全部匯出
+          </button>
+        </div>
       </footer>
       <input id="input-photos" type="file" accept="image/*" multiple hidden>
       <input id="input-camera" type="file" accept="image/*" capture="environment" hidden>
@@ -130,6 +135,9 @@
           <button type="button" role="radio" data-engine="gemini" aria-checked="false">強力（Gemini）</button>
         </div>
       </div>
+      <div class="ed-oneclick-row">
+        <button id="ed-oneclick" class="oneclick-btn" type="button"><svg aria-hidden="true"><use href="#i-sparkle"/></svg>一鍵清除</button>
+      </div>
       <div id="ed-banner" class="ai-strip dark" role="status" aria-live="polite" hidden>
         <div class="ai-text"></div>
         <div class="progress"><div class="progress-bar"></div></div>
@@ -138,7 +146,8 @@
         <canvas id="ed-view" class="stage-canvas"></canvas>
         <canvas id="ed-overlay" class="stage-canvas overlay"></canvas>
         <div id="ed-hint" class="stage-hint">
-          一根手指<b>塗抹雜物</b>，塗好按下方「✨ 移除」<br>
+          想省事：按上方「✨ 一鍵清除」<br>
+          想自己選：一根手指<b>塗抹雜物</b>，再按下方「✨ 移除」<br>
           兩根手指可放大、移動
         </div>
         <div id="ed-compare-tag" class="compare-tag" hidden>原圖</div>
@@ -164,9 +173,7 @@
           <button id="ed-undo" class="tool" type="button"><svg aria-hidden="true"><use href="#i-undo"/></svg><span>復原</span></button>
           <button id="ed-redo" class="tool" type="button"><svg aria-hidden="true"><use href="#i-redo"/></svg><span>重做</span></button>
           <button id="ed-compare" class="tool" type="button" aria-label="按住看原圖"><svg aria-hidden="true"><use href="#i-eye"/></svg><span>按住原圖</span></button>
-          <button id="ed-clear" class="tool" type="button"><svg aria-hidden="true"><use href="#i-clear"/></svg><span>清除塗抹</span></button>
-          <button id="ed-declutter" class="tool accent" type="button" hidden><svg aria-hidden="true"><use href="#i-sparkle"/></svg><span>一鍵整理</span></button>
-        </div>
+          <button id="ed-clear" class="tool" type="button"><svg aria-hidden="true"><use href="#i-clear"/></svg><span>清除塗抹</span></button>        </div>
         <button id="ed-remove" class="remove-btn" type="button" disabled>先塗抹要移除的東西</button>
         <p class="editor-rule">只移除可移動的雜物；壁癌、漏水、裂縫、窗外設施不可修掉</p>
       </footer>
@@ -203,22 +210,26 @@
             <button id="set-apikey-clear" class="btn ghost" type="button">清除</button>
           </div>
           <p id="set-apikey-result" class="key-result" role="status" aria-live="polite"></p>
-          <details class="howto">
-            <summary>怎麼取得金鑰？</summary>
-            <ol>
-              <li>用電腦或手機開啟 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">aistudio.google.com/apikey</a>，用 Google 帳號登入。</li>
-              <li>按「Create API key（建立 API 金鑰）」。</li>
-              <li>複製產生的金鑰（AIza 開頭的一長串），貼到上面欄位。</li>
-              <li>按「測試金鑰」，出現成功訊息就可以用了。</li>
-            </ol>
-            <p class="muted">金鑰只存在這支手機上，不會上傳到其他地方。使用量與費用依 Google 規定計算。</p>
-          </details>
+          <button id="set-wizard" class="btn block" type="button" style="margin-top:8px">第一次用？看設定教學（一步一步）</button>
+          <p class="muted small-note">金鑰只存在這支手機上，不會上傳到其他地方。使用量與費用依 Google 規定計算。</p>
+        </section>
+
+        <section class="card">
+          <h2>本月用量（一鍵清除）</h2>
+          <p id="set-usage" class="usage-line"></p>
+          <div class="row-actions">
+            <button id="set-usage-reset" class="btn ghost" type="button">歸零</button>
+          </div>
+          <label class="cap-row">
+            <span><b>每月上限（張）</b><small>超過時會先問你要不要繼續。留空＝不限制。</small></span>
+            <input id="set-cap" type="number" inputmode="numeric" min="0" step="1" placeholder="不限制" aria-label="每月上限張數">
+          </label>
         </section>
 
         <section class="card">
           <h2>匯出</h2>
           <label class="switch-row">
-            <span><b>加上浮水印「照片經整理示意」</b><small>只加在修過的照片右下角，原圖不加。</small></span>
+            <span><b>加上浮水印</b><small>只加在修過的照片右下角，原圖不加。一般修圖寫「照片經整理示意」，用 AI 一鍵清除的寫「AI 整理示意」。</small></span>
             <input id="set-watermark" type="checkbox" class="switch">
           </label>
         </section>

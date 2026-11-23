@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gemini 一鍵清除測試</title>
+<style>
+  :root { --bg:#f6f6f4; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#ddd; --accent:#1f6feb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#eee; --muted:#9a9a95; --card:#202020; --line:#333; --accent:#4c8dff; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; }
+  input[type=password], input[type=text], select { padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); font:inherit; }
+  input[type=password] { flex:1 1 260px; min-width:0; }
+  button { padding:9px 14px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button.secondary { background:var(--card); color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.5; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px,1fr)); gap:12px; }
+  figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:8px; }
+  figcaption { font-size:13px; color:var(--muted); margin-bottom:6px; }
+  canvas, img { width:100%; height:auto; display:block; border-radius:6px; background:#000; }
+  #info { font:13px/1.5 ui-monospace,Consolas,monospace; white-space:pre-wrap; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; margin:12px 0; }
+  #log { font:12px/1.45 ui-monospace,Consolas,monospace; white-space:pre-wrap; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; max-height:320px; overflow:auto; }
+  .muted { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<h1>Gemini 一鍵清除測試頁</h1>
+<p class="muted">金鑰只存在這個分頁的記憶體，不會儲存、不會寫進記錄。每次成功產圖約 US$0.05（2K）。</p>
+
+<div class="row">
+  <input id="key" type="password" autocomplete="off" placeholder="貼上 Gemini API 金鑰">
+  <button id="btnTest" class="secondary">測試金鑰</button>
+</div>
+<div class="row">
+  <input id="file" type="file" accept="image/*">
+  <select id="quality"><option value="2K" selected>2K</option><option value="1K">1K</option><option value="4K">4K</option></select>
+  <input id="model" type="text" placeholder="模型（預設）" size="22">
+  <label><input id="composite" type="checkbox" checked> 只貼回變更區域</label>
+</div>
+<div class="row">
+  <button id="btnRun">一鍵清除</button>
+  <button id="btnCancel" class="secondary" disabled>取消</button>
+  <button id="btnSave" class="secondary" disabled>下載結果</button>
+  <span id="status" class="muted"></span>
+</div>
+
+<div class="grid">
+  <figure><figcaption>原圖</figcaption><canvas id="before"></canvas></figure>
+  <figure><figcaption>結果</figcaption><canvas id="after"></canvas></figure>
+  <figure><figcaption>變更遮罩（白＝貼回 AI 結果）</figcaption><canvas id="mask"></canvas></figure>
+  <figure><figcaption>模型原始輸出</figcaption><canvas id="raw"></canvas></figure>
+</div>
+
+<div id="info">尚未執行</div>
+<div id="log"></div>
+
+<script type="module">
+import { declutterGemini, testGeminiKey, GEMINI_MODEL_DEFAULT, GEMINI_PRICE_PER_IMAGE_USD } from './gemini.js';
+
+const $ = (id) => document.getElementById(id);
+let source = null;      // 原圖 canvas
+let result = null;
+let ctl = null;
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString('zh-TW', { hour12: false });
+  $('log').textContent += '[' + t + '] ' + msg + '\n';
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+function show(canvasEl, src) {
+  if (!src) { canvasEl.width = 1; canvasEl.height = 1; return; }
+  const s = Math.min(1, 1200 / Math.max(src.width, src.height));
+  canvasEl.width = Math.round(src.width * s);
+  canvasEl.height = Math.round(src.height * s);
+  const g = canvasEl.getContext('2d');
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(src, 0, 0, canvasEl.width, canvasEl.height);
+}
+
+async function loadBlob(blob, name) {
+  const bmp = await createImageBitmap(blob);
+  const c = document.createElement('canvas');
+  c.width = bmp.width; c.height = bmp.height;
+  c.getContext('2d').drawImage(bmp, 0, 0);
+  bmp.close && bmp.close();
+  source = c;
+  show($('before'), c);
+  [$('after'), $('mask'), $('raw')].forEach((el) => show(el, null));
+  log('載入 ' + name + '（' + c.width + 'x' + c.height + '）');
+}
+
+async function loadDefault() {
+  try {
+    const r = await fetch('../test-photos/bedroom-before.jpg');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    await loadBlob(await r.blob(), 'bedroom-before.jpg');
+  } catch (e) {
+    log('無法載入預設圖 ../test-photos/bedroom-before.jpg：' + e.message + '（請用上方選擇檔案）');
+  }
+}
+
+$('file').addEventListener('change', async () => {
+  const f = $('file').files[0];
+  if (f) await loadBlob(f, f.name);
+});
+
+$('btnTest').addEventListener('click', async () => {
+  $('status').textContent = '測試中…';
+  log('測試金鑰（GET /v1beta/models）');
+  const r = await testGeminiKey($('key').value);
+  $('status').textContent = r.message;
+  log((r.ok ? 'OK ' : '失敗 ' + (r.code || '') + ' ') + r.message + (r.detail ? '\n  ' + r.detail : ''));
+});
+
+$('btnRun').addEventListener('click', async () => {
+  if (!source) { log('沒有圖片'); return; }
+  const apiKey = $('key').value.trim();
+  if (!apiKey) { $('status').textContent = '請先貼上金鑰'; return; }
+  ctl = new AbortController();
+  $('btnRun').disabled = true; $('btnCancel').disabled = false; $('btnSave').disabled = true;
+  const t0 = performance.now();
+  try {
+    result = await declutterGemini(source, {
+      apiKey,
+      quality: $('quality').value,
+      model: $('model').value.trim() || undefined,
+      composite: $('composite').checked,
+      debug: true,
+      signal: ctl.signal,
+      onLog: log,
+      onProgress: (p) => { $('status').textContent = p.stage; },
+    });
+    const info = result.__geminiInfo || {};
+    show($('after'), result);
+    show($('mask'), info.mask || null);
+    show($('raw'), info.raw || null);
+    const view = Object.assign({}, info);
+    delete view.mask; delete view.raw;
+    $('info').textContent =
+      '模型：' + info.model + '（預設 ' + GEMINI_MODEL_DEFAULT + '）\n' +
+      '端點：' + info.endpoint + '\n' +
+      '總耗時：' + (info.ms / 1000).toFixed(1) + ' 秒（頁面量測 ' + ((performance.now() - t0) / 1000).toFixed(1) + ' 秒）\n' +
+      '要求：' + info.requested + '　實際輸出：' + info.outputSize + '\n' +
+      'changedRatio：' + (info.changedRatio == null ? '-' : (info.changedRatio * 100).toFixed(1) + '%') +
+      '　composited：' + info.composited + (info.reason ? '（' + info.reason + '）' : '') + '\n' +
+      '估計費用：約 US$' + GEMINI_PRICE_PER_IMAGE_USD + '\n\n' + JSON.stringify(view, null, 2);
+    $('status').textContent = '完成';
+    $('btnSave').disabled = false;
+  } catch (e) {
+    $('status').textContent = e.message;
+    log('錯誤 ' + (e.code || e.name) + '：' + e.message + (e.detail ? '\n  ' + e.detail : ''));
+  } finally {
+    $('btnRun').disabled = false; $('btnCancel').disabled = true; ctl = null;
+  }
+});
+
+$('btnCancel').addEventListener('click', () => { if (ctl) ctl.abort(); });
+
+$('btnSave').addEventListener('click', () => {
+  if (!result) return;
+  result.toBlob((b) => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = 'declutter-' + Date.now() + '.jpg';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }, 'image/jpeg', 0.92);
+});
+
+loadDefault();
+</script>
+</body>
+</html>

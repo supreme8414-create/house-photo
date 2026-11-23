@@ -1,2 +1,5 @@
 ﻿*.log
 
+test-photos/
+.gemini-key
+

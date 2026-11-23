@@ -12,9 +12,10 @@ import { Editor } from './lib/editor.js';
 import { buildExportFile, deliverFiles } from './lib/export.js';
 import { showError, configureErrors, installGlobalHandlers, MEMORY_HINT } from './lib/errors.js';
 import { showTutorial } from './lib/tutorial.js';
+import * as aiui from './lib/aiui.js';
 
 /** App 版本（設定頁最下方會顯示，用來確認手機是不是跑新版） */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 
@@ -141,6 +142,12 @@ function goBack() {
 
 window.addEventListener('popstate', async (e) => {
   const s = e.state || { screen: 'home' };
+  // 全部一鍵清除進行中：不能離開
+  if (batchRunning) {
+    history.pushState(stateNow(), '');
+    ui.toast('AI 處理中，請稍候');
+    return;
+  }
   // 修圖中離開的保護
   if (cur.screen === 'editor' && ed && s.screen !== 'editor' && s.screen !== 'settings') {
     if (ed.busy) {
@@ -325,6 +332,7 @@ async function renderPhotos() {
     ? `共 ${photos.length} 張，已整理 ${edited} 張。點照片開始修圖。`
     : '';
   $('#btn-export-all').disabled = photos.length === 0;
+  $('#btn-batch-ai').disabled = photos.length === 0 || edited === photos.length;
 }
 
 function photoTile(p, i) {
@@ -468,7 +476,7 @@ async function exportAll() {
   const edited = photos.filter((p) => p.edited).length;
   const v = await ui.dialog({
     title: '全部匯出',
-    message: `共 ${photos.length} 張（已整理 ${edited} 張）。已整理的照片會匯出修好的版本${settings.watermark ? '，並加上「照片經整理示意」浮水印' : ''}。`,
+    message: `共 ${photos.length} 張（已整理 ${edited} 張）。已整理的照片會匯出修好的版本${settings.watermark ? '，並加上浮水印（「照片經整理示意」或「AI 整理示意」）' : ''}。`,
     buttons: [
       { label: `匯出全部 ${photos.length} 張`, value: 'all', primary: true },
       ...(edited && edited < photos.length ? [{ label: `只匯出已整理的 ${edited} 張`, value: 'edited' }] : []),
@@ -566,7 +574,7 @@ const editor = new Editor($('#ed-stage'), $('#ed-view'), $('#ed-overlay'));
  * 目前的修圖狀態
  * @type {null | {
  *   listingId:string, photoId:string, photo:any,
- *   history:Blob[], hIndex:number, savedIndex:number,
+ *   history:Blob[], hAI:boolean[], hIndex:number, savedIndex:number,
  *   engine:'local'|'gemini', busy:boolean,
  *   compareCanvas:HTMLCanvasElement|null, holding:boolean
  * }}
@@ -581,7 +589,7 @@ const edEls = {
   redo: $('#ed-redo'),
   compare: $('#ed-compare'),
   clear: $('#ed-clear'),
-  declutter: $('#ed-declutter'),
+  oneclick: $('#ed-oneclick'),
   remove: $('#ed-remove'),
   brush: $('#ed-brush'),
   brushDot: $('#ed-brush-dot'),
@@ -653,6 +661,8 @@ async function openEditor(listingId, photoId) {
     const edited = photo.edited ? await db.getEdited(photoId) : null;
     // 撤銷紀錄（存成 Blob，不佔 canvas 記憶體）：第 0 格永遠是原圖，所以可以一路復原回原圖
     const history = edited ? [original, edited] : [original];
+    // 每一格是否含 Gemini 產生的內容（決定匯出浮水印文字）
+    const hAI = edited ? [false, !!photo.aiGenerated] : [false];
     const hIndex = history.length - 1;
     // 舊版存的照片可能是 4096，這裡縮到工作尺寸（2560）再修
     ({ canvas } = await img.decodeToCanvas(history[hIndex], workMax));
@@ -660,7 +670,7 @@ async function openEditor(listingId, photoId) {
     editor.setImage(canvas);
     ed = {
       listingId: photo.listingId, photoId, photo,
-      history, hIndex, savedIndex: hIndex,
+      history, hAI, hIndex, savedIndex: hIndex,
       engine: sessionEngine || settings.defaultEngine,
       busy: false,
       compareCanvas: null, holding: false,
@@ -725,7 +735,7 @@ function updateEditorUI() {
   edEls.redo.disabled = b || painted || ed.hIndex >= ed.history.length - 1;
   edEls.compare.disabled = b;
   edEls.clear.disabled = b || !editor.strokes.length;
-  edEls.declutter.disabled = b;
+  edEls.oneclick.disabled = b;
   edEls.remove.disabled = b || !painted;
   edEls.remove.textContent = painted ? '✨ 移除' : '先塗抹要移除的東西';
   edEls.save.disabled = b;
@@ -765,7 +775,6 @@ function setEngine(engine, { silent = false } = {}) {
   ed.engine = engine;
   sessionEngine = engine;
   for (const s of edEls.seg) s.setAttribute('aria-checked', String(s.dataset.engine === engine));
-  edEls.declutter.hidden = engine !== 'gemini';
   if (engine === 'local') preloadModel();
   else if (!settings.apiKey && !silent) askForKey();
   refreshModelUI();
@@ -774,14 +783,15 @@ function setEngine(engine, { silent = false } = {}) {
 async function askForKey() {
   const c = await ui.dialog({
     title: '強力模式需要金鑰',
-    message: '請先到「設定」貼上 Google Gemini API 金鑰（免費申請）。\n也可以先用「免費（手機運算）」。',
+    message: '需要先設定 Google Gemini 金鑰（約 3 分鐘，一步一步教你）。\n也可以先用「免費（手機運算）」。',
     buttons: [
-      { label: '前往設定', value: 'settings', primary: true },
+      { label: '開始設定', value: 'wizard', primary: true },
       { label: '改用免費模式', value: 'local' },
     ],
   });
-  if (c === 'settings') navigate({ screen: 'settings' });
-  else if (c === 'local' || !settings.apiKey) setEngine('local', { silent: true });
+  if (c === 'wizard') {
+    if (!(await aiui.keyWizard()) && !settings.apiKey) setEngine('local', { silent: true });
+  } else if (c === 'local' || !settings.apiKey) setEngine('local', { silent: true });
 }
 
 // ---------- 塗抹（不會自動移除，要按「✨ 移除」） ----------
@@ -822,14 +832,17 @@ async function runRemoval() {
       stageBusy(true, 'AI 正在移除雜物…');
       result = await mod.inpaintLocal(editor.image, editor.getMask(), stageProgress('AI 正在移除雜物…'));
     } else {
+      if (!(await aiui.capOk(1))) return false;
+      if (ed !== session) return false;
       const g = await eng.getGeminiEngine();
       stageBusy(true, '傳送到 Gemini 處理中…');
-      result = await g.inpaintGemini(editor.image, editor.getMask(), {
+      result =await g.inpaintGemini(editor.image, editor.getMask(), {
         apiKey: settings.apiKey,
         onProgress: stageProgress('Gemini 處理中…'),
       });
     }
     if (ed !== session) { if (result) img.releaseCanvas(result); return false; } // 處理期間已離開畫面
+    if (session.engine === 'gemini') aiui.recordUsage(1);
     await commitResult(result);
     ok = true;
   } catch (e) {
@@ -850,6 +863,7 @@ async function runRemoval() {
 async function handleRemovalError(e) {
   console.error(e);
   if (!ed) return;
+  if (ed.engine === 'gemini' && await aiui.keyIssueDialog(e)) return;
   const canShrink = ed.engine === 'local' && eng.isMemoryError(e) && editor.image
     && Math.max(editor.image.width, editor.image.height) > img.SMALL_SIDE;
   if (canShrink) {
@@ -885,20 +899,39 @@ async function commitResult(resultCanvas) {
   if (!resultCanvas || !resultCanvas.width) throw new Error('AI 沒有傳回結果，請再試一次');
   stageBusy(true, '套用結果…');
   const blob = await img.canvasToBlob(resultCanvas, 'image/jpeg', 0.92);
-  // 有「重做」的紀錄就丟掉
-  ed.history = ed.history.slice(0, ed.hIndex + 1);
-  ed.history.push(blob);
-  // 上限：保留第 0 格原圖，丟掉最舊的修改
-  while (ed.history.length > HISTORY_LIMIT) {
-    ed.history.splice(1, 1);
-    if (ed.savedIndex === 1) ed.savedIndex = -1; // 已儲存的那格被丟掉 → 視為未儲存
-    else if (ed.savedIndex > 1) ed.savedIndex--;
-  }
-  ed.hIndex = ed.history.length - 1;
+  pushHistory(blob, ed.engine === 'gemini');
 
   const old = editor.image;
   editor.setImage(resultCanvas, { keepView: true });
   if (old && old !== resultCanvas) img.releaseCanvas(old);
+}
+
+/** 加一格撤銷紀錄。ai：這次是不是 Gemini 產生的（一旦用過，這張就算 AI 整理） */
+function pushHistory(blob, ai) {
+  const prevAI = !!ed.hAI[ed.hIndex];
+  // 有「重做」的紀錄就丟掉
+  ed.history = ed.history.slice(0, ed.hIndex + 1);
+  ed.hAI = ed.hAI.slice(0, ed.hIndex + 1);
+  ed.history.push(blob);
+  ed.hAI.push(prevAI || !!ai);
+  // 上限：保留第 0 格原圖，丟掉最舊的修改
+  while (ed.history.length > HISTORY_LIMIT) {
+    ed.history.splice(1, 1);
+    ed.hAI.splice(1, 1);
+    if (ed.savedIndex === 1) ed.savedIndex = -1; // 已儲存的那格被丟掉 → 視為未儲存
+    else if (ed.savedIndex > 1) ed.savedIndex--;
+  }
+  ed.hIndex = ed.history.length - 1;
+}
+
+/** 採用一個已經是 JPEG 的結果（一鍵清除）：解碼成工作影像並加入撤銷紀錄 */
+async function commitBlob(blob, ai) {
+  stageBusy(true, '套用結果…');
+  const { canvas } = await img.decodeToCanvas(blob, workMax);
+  pushHistory(blob, ai);
+  const old = editor.image;
+  editor.setImage(canvas, { keepView: true });
+  if (old && old !== canvas) img.releaseCanvas(old);
 }
 
 // ---------- 復原 / 重做 ----------
@@ -964,34 +997,90 @@ function compareEnd() {
 }
 
 // ---------- 一鍵整理（Gemini，不需塗抹） ----------
-async function declutterFlow() {
-  if (!ed || ed.busy) return;
-  if (!settings.apiKey) { askForKey(); return; }
-  const ok = await ui.dialog({
-    title: '一鍵整理',
-    message: '會由 Gemini 重新產生整張照片，自動收掉雜物。細節可能會有變化，完成後請仔細檢查。\n\n提醒：壁癌、漏水、裂縫、窗外設施等不可以被修掉，如果被改到請按「復原」。',
+let oneClickConfirmed = false;
+
+/** 第一次（每次開啟 App）按一鍵清除時，說明費用與注意事項 */
+async function confirmOneClick() {
+  if (oneClickConfirmed) return true;
+  const usd = await aiui.priceUSD();
+  const v = await ui.dialog({
+    title: '✨ 一鍵清除',
+    message: `AI 會自動移除雜物（約 NT$${aiui.fmtTWD(usd * aiui.TWD_PER_USD)}／張，以實際帳單為準），需要 20–60 秒。\n\n${aiui.AI_DISCLAIMER}。`,
     buttons: [
-      { label: '開始整理', value: true, primary: true },
+      { label: '開始', value: true, primary: true },
       { label: '取消', value: false },
     ],
   });
-  if (ok !== true || !ed) return;
+  if (v === true) oneClickConfirmed = true;
+  return v === true;
+}
+
+/**
+ * 對目前的工作影像跑一次 Gemini 一鍵清除，結果轉成 JPEG Blob（立刻釋放 canvas，省記憶體）。
+ * 使用者按「取消」回傳 null；其他錯誤丟出。
+ */
+async function declutterOnce() {
+  const hb = aiui.cancelableBusy('傳送到 AI 處理中…\n約 20–60 秒，請保持螢幕開啟');
+  try {
+    const g = await eng.getGeminiEngine();
+    const out = await g.declutterGemini(editor.image, {
+      apiKey: settings.apiKey,
+      signal: hb.signal,
+      onProgress: (p) => {
+        const d = eng.describeProgress(p, 'AI 處理中…');
+        hb.update(d.text + (d.ratio != null ? `　${Math.round(d.ratio * 100)}%` : ''), d.ratio);
+      },
+    });
+    const info = out && out.__geminiInfo ? out.__geminiInfo : null;
+    try {
+      if (!out || !out.width) throw new Error('AI 沒有傳回結果，請再試一次');
+      hb.update('整理結果中…');
+      const blob = await img.canvasToBlob(out, 'image/jpeg', 0.92);
+      const thumb = await img.makeThumb(out, 320);
+      aiui.recordUsage(1);
+      return { blob, thumb, info };
+    } finally {
+      if (out) img.releaseCanvas(out);
+    }
+  } catch (e) {
+    if (hb.cancelled) return null;
+    throw e;
+  } finally {
+    hb.close();
+  }
+}
+
+/** ✨ 一鍵清除（Gemini，不需塗抹）：處理 → 比較畫面 → 採用 */
+async function oneClickFlow() {
+  if (!ed || ed.busy) return;
+  if (!settings.apiKey) {
+    if (!(await aiui.keyWizard())) return;
+    if (!ed || ed.busy) return;
+  }
+  if (!(await confirmOneClick()) || !ed) return;
+  if (!(await aiui.capOk(1)) || !ed) return;
   editor.clearMask();
   const session = ed;
   session.busy = true;
   editor.enabled = false;
   updateEditorUI();
-  stageBusy(true, '傳送到 Gemini 處理中…');
   let failure = null;
   try {
-    const g = await eng.getGeminiEngine();
-    const result = await g.declutterGemini(editor.image, {
-      apiKey: settings.apiKey,
-      onProgress: stageProgress('Gemini 整理中…（約 10–30 秒）'),
+    const beforeBlob = session.history[session.hIndex];
+    const first = await declutterOnce();
+    if (!first || ed !== session) return;
+    const picked = await aiui.showCompare({
+      beforeBlob,
+      first,
+      rerun: async () => {
+        if (!(await aiui.capOk(1))) return null;
+        try { return await declutterOnce(); }
+        catch (e) { await aiui.geminiFailure('再試一次失敗', e); return null; }
+      },
     });
-    if (ed !== session) return;
-    await commitResult(result);
-    ui.toast('整理完成，請檢查結果；不滿意可按「復原」', 3500);
+    if (!picked || ed !== session) return;
+    await commitBlob(picked.blob, true);
+    ui.toast('已採用。按右上角「儲存」才會存進案件；小地方可用塗抹再修', 4500);
   } catch (e) {
     failure = e;
   } finally {
@@ -1002,7 +1091,111 @@ async function declutterFlow() {
       updateEditorUI();
     }
   }
-  if (failure && ed === session) showError('一鍵整理失敗', failure);
+  if (failure && ed === session) await aiui.geminiFailure('一鍵清除失敗', failure);
+}
+
+// ---------- 照片牆：全部一鍵清除 ----------
+let batchRunning = false;
+
+/** 依序處理（一次一張）。回傳 {done, failed:[{photo,index,error}], cancelled} */
+async function runBatch(items) {
+  const hb = aiui.cancelableBusy('準備中…', { cancelLabel: '停止' });
+  batchRunning = true;
+  let done = 0;
+  const failed = [];
+  try {
+    const g = await eng.getGeminiEngine();
+    const n = items.length;
+    for (let k = 0; k < n; k++) {
+      if (hb.cancelled) break;
+      const { photo, index } = items[k];
+      hb.update(`第 ${k + 1}／${n} 張`, k / n);
+      let src = null;
+      let out = null;
+      try {
+        const original = await db.getOriginal(photo.id);
+        if (!original) throw new Error('找不到原圖資料');
+        ({ canvas: src } = await img.decodeToCanvas(original, workMax));
+        out = await g.declutterGemini(src, {
+          apiKey: settings.apiKey,
+          signal: hb.signal,
+          onProgress: (p) => {
+            const d = eng.describeProgress(p, 'AI 處理中…');
+            hb.update(`第 ${k + 1}／${n} 張\n${d.text}`, (k + (d.ratio != null ? d.ratio : 0.1)) / n);
+          },
+        });
+        img.releaseCanvas(src); src = null;
+        const blob = await img.canvasToBlob(out, 'image/jpeg', 0.92);
+        const thumb = await img.makeThumb(out);
+        img.releaseCanvas(out); out = null;
+        await db.saveEdited(photo.id, blob, thumb, { aiGenerated: true });
+        aiui.recordUsage(1);
+        done++;
+      } catch (e) {
+        if (hb.cancelled) break;
+        console.error(e);
+        failed.push({ photo, index, error: e });
+        if (e && (e.code === 'BAD_KEY' || e.code === 'NO_BILLING' || e.code === 'QUOTA')) break; // 後面的也一定會失敗
+      } finally {
+        if (src) img.releaseCanvas(src);
+        if (out) img.releaseCanvas(out);
+      }
+      await tick(30);
+    }
+  } finally {
+    batchRunning = false;
+    hb.close();
+  }
+  return { done, failed, cancelled: hb.cancelled };
+}
+
+async function batchDeclutter() {
+  if (batchRunning || cur.screen !== 'listing') return;
+  const todo = (cur.photos || []).map((p, i) => ({ photo: p, index: i + 1 })).filter((x) => !x.photo.edited);
+  if (!todo.length) { ui.toast('這個案件的照片都整理過了'); return; }
+  if (!settings.apiKey) {
+    if (!(await aiui.keyWizard())) return;
+  }
+  const n = todo.length;
+  const usd = await aiui.priceUSD();
+  const each = usd * aiui.TWD_PER_USD;
+  const v = await ui.dialog({
+    title: '✨ 全部一鍵清除',
+    message: `會一張一張處理還沒整理的 ${n} 張照片，每張約 20–60 秒。處理期間請保持螢幕開啟，不要切到別的 App。\n\n預估費用約 NT$${aiui.fmtTWD(n * each)}（${n} 張 × NT$${aiui.fmtTWD(each)}，以實際帳單為準）。\n原圖會保留，結果存成整理版。\n\n${aiui.AI_DISCLAIMER}。`,
+    buttons: [
+      { label: `開始（${n} 張）`, value: true, primary: true },
+      { label: '取消', value: false },
+    ],
+  });
+  if (v !== true) return;
+
+  let items = todo;
+  const listingId = cur.listingId;
+  for (;;) {
+    if (!(await aiui.capOk(items.length))) break;
+    let r;
+    try { r = await runBatch(items); }
+    catch (e) { await aiui.geminiFailure('全部一鍵清除失敗', e); break; }
+    if (cur.screen === 'listing' && cur.listingId === listingId) await renderPhotos();
+    if (r.cancelled) { ui.toast(`已停止，完成 ${r.done} 張`, 3500); break; }
+    if (!r.failed.length) {
+      await ui.alert('全部完成 ✓', `已整理 ${r.done} 張。\n請點進照片檢查結果；有問題的可以按「復原」或在照片牆選「恢復原圖」。`);
+      break;
+    }
+    const lines = r.failed.slice(0, 8).map((f) => `第 ${f.index} 張：${eng.errorMessage(f.error)}`);
+    if (r.failed.length > 8) lines.push(`…還有 ${r.failed.length - 8} 張`);
+    const keyIssue = r.failed.some((f) => f.error && (f.error.code === 'BAD_KEY' || f.error.code === 'NO_BILLING'));
+    const c = await ui.dialog({
+      title: `完成 ${r.done} 張，${r.failed.length} 張失敗`,
+      message: lines.join('\n') + (keyIssue ? '\n\n請先到「設定」→「看設定教學」確認金鑰與帳單。' : ''),
+      buttons: [
+        { label: `重試失敗的 ${r.failed.length} 張`, value: 'retry', primary: true },
+        { label: '關閉', value: null },
+      ],
+    });
+    if (c !== 'retry') break;
+    items = r.failed.map((f) => ({ photo: f.photo, index: f.index }));
+  }
 }
 
 // ---------- 儲存 ----------
@@ -1019,11 +1212,11 @@ async function saveEdit() {
     } else {
       const blob = ed.history[ed.hIndex]; // 已是 JPEG 0.92
       const thumb = await img.makeThumb(editor.image);
-      await db.saveEdited(ed.photoId, blob, thumb);
+      await db.saveEdited(ed.photoId, blob, thumb, { aiGenerated: !!ed.hAI[ed.hIndex] });
     }
     ed.savedIndex = ed.hIndex;
     const p = (cur.photos || []).find((x) => x.id === ed.photoId);
-    if (p) p.edited = ed.hIndex !== 0;
+    if (p) { p.edited = ed.hIndex !== 0; p.aiGenerated = p.edited && !!ed.hAI[ed.hIndex]; }
     updateEditorUI();
     return true;
   } catch (e) {
@@ -1127,7 +1320,7 @@ function bindEditor() {
     editor.clearMask();
     setTool('paint');
   });
-  edEls.declutter.addEventListener('click', declutterFlow);
+  edEls.oneclick.addEventListener('click', oneClickFlow);
   edEls.fit.addEventListener('click', () => editor.fit());
   edEls.prev.addEventListener('click', () => gotoPhoto(-1));
   edEls.next.addEventListener('click', () => gotoPhoto(1));
@@ -1172,7 +1365,14 @@ async function openSettings() {
   $('#set-watermark').checked = settings.watermark;
   for (const r of document.querySelectorAll('input[name="default-engine"]')) r.checked = r.value === settings.defaultEngine;
   $('#app-version').textContent = `版本 ${APP_VERSION}`;
+  $('#set-cap').value = settings.monthlyCap ? String(settings.monthlyCap) : '';
+  renderUsage();
   renderAbout();
+}
+
+async function renderUsage() {
+  try { $('#set-usage').textContent = await aiui.usageText(); }
+  catch { $('#set-usage').textContent = `本月已用 ${settings.usageThisMonth} 張`; }
 }
 
 async function renderAbout() {
@@ -1232,6 +1432,22 @@ function bindSettings() {
       btn.disabled = false;
     }
   });
+  $('#set-wizard').addEventListener('click', async () => {
+    await aiui.keyWizard();
+    key.value = settings.apiKey;
+    result.textContent = '';
+    result.className = 'key-result';
+  });
+  $('#set-usage-reset').addEventListener('click', async () => {
+    if (!(await ui.confirm('用量歸零？', '只會把這支手機上的本月計數歸零，不影響 Google 帳單。', { okLabel: '歸零' }))) return;
+    settings.resetUsage();
+    renderUsage();
+  });
+  $('#set-cap').addEventListener('change', (e) => {
+    settings.monthlyCap = e.currentTarget.value;
+    e.currentTarget.value = settings.monthlyCap ? String(settings.monthlyCap) : '';
+    ui.toast(settings.monthlyCap ? `每月上限 ${settings.monthlyCap} 張` : '不限制每月張數');
+  });
   $('#set-watermark').addEventListener('change', (e) => {
     settings.watermark = e.currentTarget.checked;
     ui.toast(settings.watermark ? '匯出時會加上浮水印' : '匯出時不加浮水印');
@@ -1258,10 +1474,12 @@ function bindMain() {
   $('#btn-listing-more').addEventListener('click', async () => {
     if (!cur.listing) return;
     const v = await ui.actionSheet(cur.listing.name, [
+      { label: '✨ 全部一鍵清除', value: 'batch' },
       { label: '重新命名', value: 'rename' },
       { label: '全部匯出', value: 'export' },
       { label: '刪除案件', value: 'delete', danger: true },
     ]);
+    if (v === 'batch') batchDeclutter();
     if (v === 'rename') renameListingFlow(cur.listing);
     if (v === 'export') exportAll();
     if (v === 'delete') deleteListingFlow({ ...cur.listing, count: cur.photos.length });
@@ -1279,6 +1497,7 @@ function bindMain() {
     });
   }
   $('#btn-export-all').addEventListener('click', exportAll);
+  $('#btn-batch-ai').addEventListener('click', batchDeclutter);
 }
 
 // =========================================================
